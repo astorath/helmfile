@@ -9,8 +9,12 @@ type LoadOpts struct {
 	Selectors   []string
 	Environment state.SubhelmfileEnvironmentSpec
 
+	RetainValuesFiles bool
+
 	// CalleePath is the absolute path to the file being loaded
 	CalleePath string
+
+	Reverse bool
 }
 
 func (o LoadOpts) DeepCopy() LoadOpts {

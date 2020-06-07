@@ -20,11 +20,11 @@ type mockRunner struct {
 }
 
 func (mock *mockRunner) Execute(cmd string, args []string, env map[string]string) ([]byte, error) {
-	return []byte{}, nil
+	return mock.output, mock.err
 }
 
 func MockExecer(logger *zap.SugaredLogger, kubeContext string) *execer {
-	execer := New(logger, kubeContext, &mockRunner{})
+	execer := New("helm", logger, kubeContext, &mockRunner{})
 	return execer
 }
 
@@ -32,10 +32,7 @@ func MockExecer(logger *zap.SugaredLogger, kubeContext string) *execer {
 
 func TestNewHelmExec(t *testing.T) {
 	buffer := bytes.NewBufferString("something")
-	logger := NewLogger(buffer, "debug")
-	helm := New(logger, "dev", &ShellRunner{
-		Logger: logger,
-	})
+	helm := MockExecer(NewLogger(buffer, "debug"), "dev")
 	if helm.kubeContext != "dev" {
 		t.Error("helmexec.New() - kubeContext")
 	}
@@ -48,11 +45,7 @@ func TestNewHelmExec(t *testing.T) {
 }
 
 func Test_SetExtraArgs(t *testing.T) {
-	buffer := bytes.NewBufferString("something")
-	logger := NewLogger(buffer, "debug")
-	helm := New(NewLogger(os.Stdout, "info"), "dev", &ShellRunner{
-		Logger: logger,
-	})
+	helm := MockExecer(NewLogger(os.Stdout, "info"), "dev")
 	helm.SetExtraArgs()
 	if len(helm.extra) != 0 {
 		t.Error("helmexec.SetExtraArgs() - passing no arguments should not change extra field")
@@ -68,11 +61,7 @@ func Test_SetExtraArgs(t *testing.T) {
 }
 
 func Test_SetHelmBinary(t *testing.T) {
-	buffer := bytes.NewBufferString("something")
-	logger := NewLogger(buffer, "debug")
-	helm := New(NewLogger(os.Stdout, "info"), "dev", &ShellRunner{
-		Logger: logger,
-	})
+	helm := MockExecer(NewLogger(os.Stdout, "info"), "dev")
 	if helm.helmBinary != "helm" {
 		t.Error("helmexec.command - default command is not helm")
 	}
@@ -86,7 +75,7 @@ func Test_AddRepo(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
-	helm.AddRepo("myRepo", "https://repo.example.com/", "cert.pem", "key.pem", "", "")
+	helm.AddRepo("myRepo", "https://repo.example.com/", "", "cert.pem", "key.pem", "", "")
 	expected := `Adding repo myRepo https://repo.example.com/
 exec: helm repo add myRepo https://repo.example.com/ --cert-file cert.pem --key-file key.pem --kube-context dev
 exec: helm repo add myRepo https://repo.example.com/ --cert-file cert.pem --key-file key.pem --kube-context dev: 
@@ -96,7 +85,17 @@ exec: helm repo add myRepo https://repo.example.com/ --cert-file cert.pem --key-
 	}
 
 	buffer.Reset()
-	helm.AddRepo("myRepo", "https://repo.example.com/", "", "", "", "")
+	helm.AddRepo("myRepo", "https://repo.example.com/", "ca.crt", "", "", "", "")
+	expected = `Adding repo myRepo https://repo.example.com/
+exec: helm repo add myRepo https://repo.example.com/ --ca-file ca.crt --kube-context dev
+exec: helm repo add myRepo https://repo.example.com/ --ca-file ca.crt --kube-context dev: 
+`
+	if buffer.String() != expected {
+		t.Errorf("helmexec.AddRepo()\nactual = %v\nexpect = %v", buffer.String(), expected)
+	}
+
+	buffer.Reset()
+	helm.AddRepo("myRepo", "https://repo.example.com/", "", "", "", "", "")
 	expected = `Adding repo myRepo https://repo.example.com/
 exec: helm repo add myRepo https://repo.example.com/ --kube-context dev
 exec: helm repo add myRepo https://repo.example.com/ --kube-context dev: 
@@ -106,10 +105,19 @@ exec: helm repo add myRepo https://repo.example.com/ --kube-context dev:
 	}
 
 	buffer.Reset()
-	helm.AddRepo("myRepo", "https://repo.example.com/", "", "", "example_user", "example_password")
+	helm.AddRepo("myRepo", "https://repo.example.com/", "", "", "", "example_user", "example_password")
 	expected = `Adding repo myRepo https://repo.example.com/
 exec: helm repo add myRepo https://repo.example.com/ --username example_user --password example_password --kube-context dev
 exec: helm repo add myRepo https://repo.example.com/ --username example_user --password example_password --kube-context dev: 
+`
+	if buffer.String() != expected {
+		t.Errorf("helmexec.AddRepo()\nactual = %v\nexpect = %v", buffer.String(), expected)
+	}
+
+	buffer.Reset()
+	helm.AddRepo("", "https://repo.example.com/", "", "", "", "", "")
+	expected = `empty field name
+
 `
 	if buffer.String() != expected {
 		t.Errorf("helmexec.AddRepo()\nactual = %v\nexpect = %v", buffer.String(), expected)
@@ -247,7 +255,7 @@ func Test_DiffRelease(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
-	helm.DiffRelease(HelmContext{}, "release", "chart", "--timeout 10", "--wait")
+	helm.DiffRelease(HelmContext{}, "release", "chart", false, "--timeout 10", "--wait")
 	expected := `Comparing release=release, chart=chart
 exec: helm diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait --kube-context dev
 exec: helm diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait --kube-context dev: 
@@ -257,7 +265,7 @@ exec: helm diff upgrade --reset-values --allow-unreleased release chart --timeou
 	}
 
 	buffer.Reset()
-	helm.DiffRelease(HelmContext{}, "release", "chart")
+	helm.DiffRelease(HelmContext{}, "release", "chart", false)
 	expected = `Comparing release=release, chart=chart
 exec: helm diff upgrade --reset-values --allow-unreleased release chart --kube-context dev
 exec: helm diff upgrade --reset-values --allow-unreleased release chart --kube-context dev: 
@@ -271,7 +279,7 @@ func Test_DiffReleaseTillerless(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
-	helm.DiffRelease(HelmContext{Tillerless: true}, "release", "chart", "--timeout 10", "--wait")
+	helm.DiffRelease(HelmContext{Tillerless: true}, "release", "chart", false, "--timeout 10", "--wait")
 	expected := `Comparing release=release, chart=chart
 exec: helm tiller run -- helm diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait --kube-context dev
 exec: helm tiller run -- helm diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait --kube-context dev: 
@@ -453,7 +461,7 @@ func Test_LogLevels(t *testing.T) {
 		buffer.Reset()
 		logger := NewLogger(&buffer, logLevel)
 		helm := MockExecer(logger, "")
-		helm.AddRepo("myRepo", "https://repo.example.com/", "", "", "example_user", "example_password")
+		helm.AddRepo("myRepo", "https://repo.example.com/", "", "", "", "example_user", "example_password")
 		if buffer.String() != expected {
 			t.Errorf("helmexec.AddRepo()\nactual = %v\nexpect = %v", buffer.String(), expected)
 		}
@@ -506,4 +514,59 @@ exec: helm template path/to/chart --name release --values file.yml --kube-contex
 	if buffer.String() != expected {
 		t.Errorf("helmexec.Template()\nactual = %v\nexpect = %v", buffer.String(), expected)
 	}
+}
+
+func Test_IsHelm3(t *testing.T) {
+	helm2Runner := mockRunner{output: []byte("Client: v2.16.0+ge13bc94\n")}
+	helm := New("helm", NewLogger(os.Stdout, "info"), "dev", &helm2Runner)
+	if helm.IsHelm3() {
+		t.Error("helmexec.IsHelm3() - Detected Helm 3 with Helm 2 version")
+	}
+
+	helm3Runner := mockRunner{output: []byte("v3.0.0+ge29ce2a\n")}
+	helm = New("helm", NewLogger(os.Stdout, "info"), "dev", &helm3Runner)
+	if !helm.IsHelm3() {
+		t.Error("helmexec.IsHelm3() - Failed to detect Helm 3")
+	}
+
+	os.Setenv("HELMFILE_HELM3", "1")
+	helm2Runner = mockRunner{output: []byte("Client: v2.16.0+ge13bc94\n")}
+	helm = New("helm", NewLogger(os.Stdout, "info"), "dev", &helm2Runner)
+	if !helm.IsHelm3() {
+		t.Error("helmexec.IsHelm3() - Helm3 not detected when HELMFILE_HELM3 is set")
+	}
+	os.Setenv("HELMFILE_HELM3", "")
+}
+
+func Test_GetVersion(t *testing.T) {
+	helm2Runner := mockRunner{output: []byte("Client: v2.16.1+ge13bc94\n")}
+	helm := New("helm", NewLogger(os.Stdout, "info"), "dev", &helm2Runner)
+	ver := helm.GetVersion()
+	if ver.Major != 2 || ver.Minor != 16 || ver.Patch != 1 {
+		t.Error(fmt.Sprintf("helmexec.GetVersion - did not detect correct Helm2 version; it was: %+v", ver))
+	}
+
+	helm3Runner := mockRunner{output: []byte("v3.2.4+ge29ce2a\n")}
+	helm = New("helm", NewLogger(os.Stdout, "info"), "dev", &helm3Runner)
+	ver = helm.GetVersion()
+	if ver.Major != 3 || ver.Minor != 2 || ver.Patch != 4 {
+		t.Error(fmt.Sprintf("helmexec.GetVersion - did not detect correct Helm3 version; it was: %+v", ver))
+	}
+}
+
+func Test_IsVersionAtLeast(t *testing.T) {
+	helm2Runner := mockRunner{output: []byte("Client: v2.16.1+ge13bc94\n")}
+	helm := New("helm", NewLogger(os.Stdout, "info"), "dev", &helm2Runner)
+	if !helm.IsVersionAtLeast(2, 1) {
+		t.Error("helmexec.IsVersionAtLeast - 2.16.1 not atleast 2.1")
+	}
+
+	if helm.IsVersionAtLeast(2, 19) {
+		t.Error("helmexec.IsVersionAtLeast - 2.16.1 is atleast 2.19")
+	}
+
+	if helm.IsVersionAtLeast(3, 2) {
+		t.Error("helmexec.IsVersionAtLeast - 2.16.1 is atleast 3.2")
+	}
+
 }

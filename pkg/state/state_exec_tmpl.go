@@ -4,28 +4,12 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/imdario/mergo"
-	"github.com/roboll/helmfile/pkg/maputil"
 	"github.com/roboll/helmfile/pkg/tmpl"
 	"gopkg.in/yaml.v2"
 )
 
 func (st *HelmState) Values() (map[string]interface{}, error) {
-	vals := map[string]interface{}{}
-
-	if err := mergo.Merge(&vals, st.Env.Defaults, mergo.WithOverride); err != nil {
-		return nil, err
-	}
-	if err := mergo.Merge(&vals, st.Env.Values, mergo.WithOverride); err != nil {
-		return nil, err
-	}
-
-	vals, err := maputil.CastKeysToStrings(vals)
-	if err != nil {
-		return nil, err
-	}
-
-	return vals, nil
+	return st.Env.GetMergedValues()
 }
 
 func (st *HelmState) mustLoadVals() map[string]interface{} {
@@ -39,7 +23,7 @@ func (st *HelmState) mustLoadVals() map[string]interface{} {
 func (st *HelmState) valuesFileTemplateData() EnvironmentTemplateData {
 	return EnvironmentTemplateData{
 		Environment: st.Env,
-		Namespace:   st.Namespace,
+		Namespace:   st.OverrideNamespace,
 		Values:      st.mustLoadVals(),
 	}
 }

@@ -31,12 +31,15 @@ func (r *desiredStateLoader) renderPrestate(firstPassEnv *environment.Environmen
 	yamlBuf, err := firstPassRenderer.RenderTemplateContentToBuffer(content)
 	if err != nil && r.logger != nil {
 		r.logger.Debugf("first-pass rendering input of \"%s\":\n%s", filename, prependLineNumbers(string(content)))
+		r.logger.Debugf("template syntax error: %v", err)
 		if yamlBuf == nil { // we have a template syntax error, let the second parse report
-			r.logger.Debugf("template syntax error: %v", err)
 			return firstPassEnv, nil
 		}
 	}
 	yamlData := yamlBuf.String()
+	if r.logger != nil {
+		r.logger.Debugf("first-pass rendering output of \"%s\":\n%s", filename, prependLineNumbers(yamlData))
+	}
 
 	// Work-around for https://github.com/golang/go/issues/24963
 	sanitized := strings.ReplaceAll(yamlData, "<no value>", "")
@@ -53,7 +56,7 @@ func (r *desiredStateLoader) renderPrestate(firstPassEnv *environment.Environmen
 	if err != nil && r.logger != nil {
 		switch err.(type) {
 		case *state.StateLoadError:
-			r.logger.Infof("could not deduce `environment:` block, configuring only .Environment.Name. error: %v", err)
+			r.logger.Debugf("could not deduce `environment:` block, configuring only .Environment.Name. error: %v", err)
 		}
 		r.logger.Debugf("error in first-pass rendering: result of \"%s\":\n%s", filename, prependLineNumbers(yamlBuf.String()))
 	}
@@ -113,15 +116,13 @@ func (r *desiredStateLoader) twoPassRenderTemplateToYaml(inherited, overrode *en
 		r.logger.Debugf("first-pass rendering result of \"%s\": %v", filename, *finalEnv)
 	}
 
-	vals := map[string]interface{}{}
+	vals, err := finalEnv.GetMergedValues()
+	if err != nil {
+		return nil, err
+	}
+
 	if prestate != nil {
 		prestate.Env = *finalEnv
-		vals, err = prestate.Values()
-		if err != nil {
-			return nil, err
-		}
-	}
-	if prestate != nil {
 		r.logger.Debugf("vals:\n%v\ndefaultVals:%v", vals, prestate.DefaultValues)
 	}
 

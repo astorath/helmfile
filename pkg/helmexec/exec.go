@@ -6,15 +6,13 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-)
-
-const (
-	command = "helm"
 )
 
 type decryptedSecret struct {
@@ -24,6 +22,7 @@ type decryptedSecret struct {
 
 type execer struct {
 	helmBinary           string
+	version              Version
 	runner               Runner
 	logger               *zap.SugaredLogger
 	kubeContext          string
@@ -49,10 +48,62 @@ func NewLogger(writer io.Writer, logLevel string) *zap.SugaredLogger {
 	return zap.New(core).Sugar()
 }
 
+func getHelmVersion(helmBinary string, logger *zap.SugaredLogger, runner Runner) Version {
+
+	// Autodetect from `helm verison`
+	bytes, err := runner.Execute(helmBinary, []string{"version", "--client", "--short"}, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	if bytes == nil || len(bytes) == 0 {
+		return Version{}
+	}
+
+	re := regexp.MustCompile("v(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)")
+	matches := re.FindStringSubmatch(string(bytes))
+
+	result := make(map[string]string)
+	for i, name := range re.SubexpNames() {
+		result[name] = matches[i]
+	}
+
+	major, err := strconv.Atoi(result["major"])
+	if err != nil {
+		panic(err)
+	}
+
+	minor, err := strconv.Atoi(result["minor"])
+	if err != nil {
+		panic(err)
+	}
+
+	patch, err := strconv.Atoi(result["patch"])
+	if err != nil {
+		panic(err)
+	}
+
+	// Support explicit helm3 opt-in via environment variable
+	if os.Getenv("HELMFILE_HELM3") != "" && major < 3 {
+		return Version{
+			Major: 3,
+			Minor: 0,
+			Patch: 0,
+		}
+	}
+
+	return Version{
+		Major: major,
+		Minor: minor,
+		Patch: patch,
+	}
+}
+
 // New for running helm commands
-func New(logger *zap.SugaredLogger, kubeContext string, runner Runner) *execer {
+func New(helmBinary string, logger *zap.SugaredLogger, kubeContext string, runner Runner) *execer {
 	return &execer{
-		helmBinary:       command,
+		helmBinary:       helmBinary,
+		version:          getHelmVersion(helmBinary, logger, runner),
 		logger:           logger,
 		kubeContext:      kubeContext,
 		runner:           runner,
@@ -68,11 +119,18 @@ func (helm *execer) SetHelmBinary(bin string) {
 	helm.helmBinary = bin
 }
 
-func (helm *execer) AddRepo(name, repository, certfile, keyfile, username, password string) error {
+func (helm *execer) AddRepo(name, repository, cafile, certfile, keyfile, username, password string) error {
 	var args []string
+	if name == "" && repository != "" {
+		helm.logger.Infof("empty field name\n")
+		return fmt.Errorf("empty field name")
+	}
 	args = append(args, "repo", "add", name, repository)
 	if certfile != "" && keyfile != "" {
 		args = append(args, "--cert-file", certfile, "--key-file", keyfile)
+	}
+	if cafile != "" {
+		args = append(args, "--ca-file", cafile)
 	}
 	if username != "" && password != "" {
 		args = append(args, "--username", username, "--password", password)
@@ -106,8 +164,15 @@ func (helm *execer) UpdateDeps(chart string) error {
 
 func (helm *execer) SyncRelease(context HelmContext, name, chart string, flags ...string) error {
 	helm.logger.Infof("Upgrading release=%v, chart=%v", name, chart)
-	preArgs := context.GetTillerlessArgs(helm.helmBinary)
+	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
+
+	if helm.IsHelm3() {
+		flags = append(flags, "--history-max", strconv.Itoa(context.HistoryMax))
+	} else {
+		env["HELM_TILLER_HISTORY_MAX"] = strconv.Itoa(context.HistoryMax)
+	}
+
 	out, err := helm.exec(append(append(preArgs, "upgrade", "--install", "--reset-values", name, chart), flags...), env)
 	helm.write(out)
 	return err
@@ -115,7 +180,7 @@ func (helm *execer) SyncRelease(context HelmContext, name, chart string, flags .
 
 func (helm *execer) ReleaseStatus(context HelmContext, name string, flags ...string) error {
 	helm.logger.Infof("Getting status %v", name)
-	preArgs := context.GetTillerlessArgs(helm.helmBinary)
+	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
 	out, err := helm.exec(append(append(preArgs, "status", name), flags...), env)
 	helm.write(out)
@@ -124,9 +189,27 @@ func (helm *execer) ReleaseStatus(context HelmContext, name string, flags ...str
 
 func (helm *execer) List(context HelmContext, filter string, flags ...string) (string, error) {
 	helm.logger.Infof("Listing releases matching %v", filter)
-	preArgs := context.GetTillerlessArgs(helm.helmBinary)
+	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
-	out, err := helm.exec(append(append(preArgs, "list", filter), flags...), env)
+	var args []string
+	if helm.IsHelm3() {
+		args = []string{"list", "--filter", filter}
+	} else {
+		args = []string{"list", filter}
+	}
+
+	out, err := helm.exec(append(append(preArgs, args...), flags...), env)
+	// In v2 we have been expecting `helm list FILTER` prints nothing.
+	// In v3 helm still prints the header like `NAME	NAMESPACE	REVISION	UPDATED	STATUS	CHART	APP VERSION`,
+	// which confuses helmfile's existing logic that treats any non-empty output from `helm list` is considered as the indication
+	// of the release to exist.
+	//
+	// This fixes it by removing the header from the v3 output, so that the output is formatted the same as that of v2.
+	if helm.IsHelm3() {
+		lines := strings.Split(string(out), "\n")
+		lines = lines[1:]
+		out = []byte(strings.Join(lines, "\n"))
+	}
 	helm.write(out)
 	return string(out), err
 }
@@ -153,7 +236,7 @@ func (helm *execer) DecryptSecret(context HelmContext, name string, flags ...str
 		helm.decryptedSecretMutex.Unlock()
 
 		helm.logger.Infof("Decrypting secret %v", absPath)
-		preArgs := context.GetTillerlessArgs(helm.helmBinary)
+		preArgs := context.GetTillerlessArgs(helm)
 		env := context.getTillerlessEnv()
 		out, err := helm.exec(append(append(preArgs, "secrets", "dec", absPath), flags...), env)
 		helm.info(out)
@@ -201,14 +284,21 @@ func (helm *execer) DecryptSecret(context HelmContext, name string, flags ...str
 
 func (helm *execer) TemplateRelease(name string, chart string, flags ...string) error {
 	helm.logger.Infof("Templating release=%v, chart=%v", name, chart)
-	out, err := helm.exec(append([]string{"template", chart, "--name", name}, flags...), map[string]string{})
+	var args []string
+	if helm.IsHelm3() {
+		args = []string{"template", name, chart}
+	} else {
+		args = []string{"template", chart, "--name", name}
+	}
+
+	out, err := helm.exec(append(args, flags...), map[string]string{})
 	helm.write(out)
 	return err
 }
 
-func (helm *execer) DiffRelease(context HelmContext, name, chart string, flags ...string) error {
+func (helm *execer) DiffRelease(context HelmContext, name, chart string, suppressDiff bool, flags ...string) error {
 	helm.logger.Infof("Comparing release=%v, chart=%v", name, chart)
-	preArgs := context.GetTillerlessArgs(helm.helmBinary)
+	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
 	out, err := helm.exec(append(append(preArgs, "diff", "upgrade", "--reset-values", "--allow-unreleased", name, chart), flags...), env)
 	// Do our best to write STDOUT only when diff existed
@@ -224,11 +314,13 @@ func (helm *execer) DiffRelease(context HelmContext, name, chart string, flags .
 		switch e := err.(type) {
 		case ExitError:
 			if e.ExitStatus() == 2 {
-				helm.write(out)
+				if !(suppressDiff) {
+					helm.write(out)
+				}
 				return err
 			}
 		}
-	} else {
+	} else if !(suppressDiff) {
 		helm.write(out)
 	}
 	return err
@@ -250,7 +342,7 @@ func (helm *execer) Fetch(chart string, flags ...string) error {
 
 func (helm *execer) DeleteRelease(context HelmContext, name string, flags ...string) error {
 	helm.logger.Infof("Deleting %v", name)
-	preArgs := context.GetTillerlessArgs(helm.helmBinary)
+	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
 	out, err := helm.exec(append(append(preArgs, "delete", name), flags...), env)
 	helm.write(out)
@@ -259,9 +351,10 @@ func (helm *execer) DeleteRelease(context HelmContext, name string, flags ...str
 
 func (helm *execer) TestRelease(context HelmContext, name string, flags ...string) error {
 	helm.logger.Infof("Testing %v", name)
-	preArgs := context.GetTillerlessArgs(helm.helmBinary)
+	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
-	out, err := helm.exec(append(append(preArgs, "test", name), flags...), env)
+	args := []string{"test", name}
+	out, err := helm.exec(append(append(preArgs, args...), flags...), env)
 	helm.write(out)
 	return err
 }
@@ -291,4 +384,16 @@ func (helm *execer) write(out []byte) {
 	if len(out) > 0 {
 		fmt.Printf("%s\n", out)
 	}
+}
+
+func (helm *execer) IsHelm3() bool {
+	return helm.version.Major == 3
+}
+
+func (helm *execer) GetVersion() Version {
+	return helm.version
+}
+
+func (helm *execer) IsVersionAtLeast(major int, minor int) bool {
+	return helm.version.Major >= major && helm.version.Minor >= minor
 }

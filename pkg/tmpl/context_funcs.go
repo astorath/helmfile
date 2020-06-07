@@ -2,6 +2,8 @@ package tmpl
 
 import (
 	"fmt"
+	"github.com/roboll/helmfile/pkg/helmexec"
+	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 	"io"
 	"os"
@@ -16,15 +18,18 @@ type Values = map[string]interface{}
 
 func (c *Context) createFuncMap() template.FuncMap {
 	funcMap := template.FuncMap{
-		"exec":           c.Exec,
-		"readFile":       c.ReadFile,
-		"toYaml":         ToYaml,
-		"fromYaml":       FromYaml,
-		"setValueAtPath": SetValueAtPath,
-		"requiredEnv":    RequiredEnv,
-		"get":            get,
-		"getOrNil":       getOrNil,
-		"tpl":            c.Tpl,
+		"exec":             c.Exec,
+		"readFile":         c.ReadFile,
+		"toYaml":           ToYaml,
+		"fromYaml":         FromYaml,
+		"setValueAtPath":   SetValueAtPath,
+		"requiredEnv":      RequiredEnv,
+		"get":              get,
+		"getOrNil":         getOrNil,
+		"tpl":              c.Tpl,
+		"required":         Required,
+		"fetchSecretValue": fetchSecretValue,
+		"expandSecretRefs": fetchSecretValues,
 	}
 	if c.preRender {
 		// disable potential side-effect template calls
@@ -58,60 +63,56 @@ func (c *Context) Exec(command string, args []interface{}, inputs ...string) (st
 	cmd := exec.Command(command, strArgs...)
 	cmd.Dir = c.basePath
 
-	writeErrs := make(chan error)
-	cmdErrs := make(chan error)
-	cmdOuts := make(chan []byte)
+	g := errgroup.Group{}
 
 	if len(input) > 0 {
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return "", err
 		}
-		go func(input string, stdin io.WriteCloser) {
+
+		g.Go(func() error {
 			defer stdin.Close()
-			defer close(writeErrs)
 
 			size := len(input)
 
-			var n int
-			var err error
 			i := 0
+
 			for {
-				n, err = io.WriteString(stdin, input[i:])
+				n, err := io.WriteString(stdin, input[i:])
 				if err != nil {
-					writeErrs <- fmt.Errorf("failed while writing %d bytes to stdin of \"%s\": %v", len(input), command, err)
-					break
+					return fmt.Errorf("failed while writing %d bytes to stdin of \"%s\": %v", len(input), command, err)
 				}
+
 				i += n
-				if n == size {
-					break
+
+				if i == size {
+					return nil
 				}
 			}
-		}(input, stdin)
+		})
 	}
 
-	go func() {
-		defer close(cmdOuts)
-		defer close(cmdErrs)
+	var bytes []byte
 
-		bytes, err := cmd.Output()
+	g.Go(func() error {
+		// We use CombinedOutput to produce helpful error messages
+		// See https://github.com/roboll/helmfile/issues/1158
+		bs, err := helmexec.Output(cmd)
 		if err != nil {
-			cmdErrs <- fmt.Errorf("exec cmd=%s args=[%s] failed: %v", command, strings.Join(strArgs, ", "), err)
-		} else {
-			cmdOuts <- bytes
+			return err
 		}
-	}()
 
-	for {
-		select {
-		case bytes := <-cmdOuts:
-			return string(bytes), nil
-		case err := <-cmdErrs:
-			return "", err
-		case err := <-writeErrs:
-			return "", err
-		}
+		bytes = bs
+
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return "", err
 	}
+
+	return string(bytes), nil
 }
 
 func (c *Context) ReadFile(filename string) (string, error) {
@@ -205,4 +206,16 @@ func RequiredEnv(name string) (string, error) {
 	}
 
 	return "", fmt.Errorf("required env var `%s` is not set", name)
+}
+
+func Required(warn string, val interface{}) (interface{}, error) {
+	if val == nil {
+		return nil, fmt.Errorf(warn)
+	} else if _, ok := val.(string); ok {
+		if val == "" {
+			return nil, fmt.Errorf(warn)
+		}
+	}
+
+	return val, nil
 }

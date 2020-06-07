@@ -5,16 +5,15 @@ import (
 	"os"
 	"strings"
 
+	"github.com/roboll/helmfile/pkg/app/version"
+
 	"github.com/roboll/helmfile/pkg/app"
 	"github.com/roboll/helmfile/pkg/helmexec"
 	"github.com/roboll/helmfile/pkg/maputil"
 	"github.com/roboll/helmfile/pkg/state"
 	"github.com/urfave/cli"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
-
-var Version string
 
 var logger *zap.SugaredLogger
 
@@ -22,13 +21,10 @@ func configureLogging(c *cli.Context) error {
 	// Valid levels:
 	// https://github.com/uber-go/zap/blob/7e7e266a8dbce911a49554b945538c5b950196b8/zapcore/level.go#L126
 	logLevel := c.GlobalString("log-level")
-	if c.GlobalBool("quiet") {
+	if c.GlobalBool("debug") {
+		logLevel = "debug"
+	} else if c.GlobalBool("quiet") {
 		logLevel = "warn"
-	}
-	var level zapcore.Level
-	err := level.Set(logLevel)
-	if err != nil {
-		return err
 	}
 	logger = helmexec.NewLogger(os.Stderr, logLevel)
 	if c.App.Metadata == nil {
@@ -45,11 +41,12 @@ func main() {
 	cliApp := cli.NewApp()
 	cliApp.Name = "helmfile"
 	cliApp.Usage = ""
-	cliApp.Version = Version
+	cliApp.Version = version.Version
 	cliApp.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "helm-binary, b",
 			Usage: "path to helm binary",
+			Value: app.DefaultHelmBinary,
 		},
 		cli.StringFlag{
 			Name:  "file, f",
@@ -74,6 +71,14 @@ func main() {
 		cli.StringFlag{
 			Name:  "kube-context",
 			Usage: "Set kubectl context. Uses current context by default",
+		},
+		cli.BoolFlag{
+			Name:  "debug",
+			Usage: "Enable verbose output for Helm and set log-level to debug, this disables --quiet/-q effect",
+		},
+		cli.BoolFlag{
+			Name:  "no-color",
+			Usage: "Output without color",
 		},
 		cli.StringFlag{
 			Name:  "log-level",
@@ -111,6 +116,10 @@ func main() {
 					Value: "",
 					Usage: "pass args to helm exec",
 				},
+				cli.BoolFlag{
+					Name:  "skip-repos",
+					Usage: "skip running `helm repo update` before running `helm dependency build`",
+				},
 			},
 			Action: action(func(run *app.App, c configImpl) error {
 				return run.Deps(c)
@@ -140,6 +149,10 @@ func main() {
 					Usage: "pass args to helm exec",
 				},
 				cli.StringSliceFlag{
+					Name:  "set",
+					Usage: "additional values to be merged into the command",
+				},
+				cli.StringSliceFlag{
 					Name:  "values",
 					Usage: "additional value files to be merged into the command",
 				},
@@ -163,6 +176,10 @@ func main() {
 					Usage: "pass args to helm exec",
 				},
 				cli.StringSliceFlag{
+					Name:  "set",
+					Usage: "additional values to be merged into the command",
+				},
+				cli.StringSliceFlag{
 					Name:  "values",
 					Usage: "additional value files to be merged into the command",
 				},
@@ -175,6 +192,10 @@ func main() {
 					Usage: "return a non-zero exit code when there are changes",
 				},
 				cli.BoolFlag{
+					Name:  "include-tests",
+					Usage: "enable the diffing of the helm test hooks",
+				},
+				cli.BoolFlag{
 					Name:  "suppress-secrets",
 					Usage: "suppress secrets in the output. highly recommended to specify on CI/CD use-cases",
 				},
@@ -182,6 +203,11 @@ func main() {
 					Name:  "concurrency",
 					Value: 0,
 					Usage: "maximum number of concurrent helm processes to run, 0 is unlimited",
+				},
+				cli.IntFlag{
+					Name:  "context",
+					Value: 0,
+					Usage: "output NUM lines of context around changes",
 				},
 			},
 			Action: action(func(run *app.App, c configImpl) error {
@@ -198,6 +224,10 @@ func main() {
 					Usage: "pass args to helm template",
 				},
 				cli.StringSliceFlag{
+					Name:  "set",
+					Usage: "additional values to be merged into the command",
+				},
+				cli.StringSliceFlag{
 					Name:  "values",
 					Usage: "additional value files to be merged into the command",
 				},
@@ -209,6 +239,10 @@ func main() {
 					Name:  "concurrency",
 					Value: 0,
 					Usage: "maximum number of concurrent downloads of release charts",
+				},
+				cli.BoolFlag{
+					Name:  "validate",
+					Usage: "validate your manifests against the Kubernetes cluster you are currently pointing at",
 				},
 				cli.BoolFlag{
 					Name:  "skip-deps",
@@ -227,6 +261,10 @@ func main() {
 					Name:  "args",
 					Value: "",
 					Usage: "pass args to helm exec",
+				},
+				cli.StringSliceFlag{
+					Name:  "set",
+					Usage: "additional values to be merged into the command",
 				},
 				cli.StringSliceFlag{
 					Name:  "values",
@@ -250,6 +288,10 @@ func main() {
 			Name:  "sync",
 			Usage: "sync all resources from state file (repos, releases and chart deps)",
 			Flags: []cli.Flag{
+				cli.StringSliceFlag{
+					Name:  "set",
+					Usage: "additional values to be merged into the command",
+				},
 				cli.StringSliceFlag{
 					Name:  "values",
 					Usage: "additional value files to be merged into the command",
@@ -278,6 +320,10 @@ func main() {
 			Usage: "apply all resources from state file only when there are changes",
 			Flags: []cli.Flag{
 				cli.StringSliceFlag{
+					Name:  "set",
+					Usage: "additional values to be merged into the command",
+				},
+				cli.StringSliceFlag{
 					Name:  "values",
 					Usage: "additional value files to be merged into the command",
 				},
@@ -286,14 +332,35 @@ func main() {
 					Value: 0,
 					Usage: "maximum number of concurrent helm processes to run, 0 is unlimited",
 				},
+				cli.IntFlag{
+					Name:  "context",
+					Value: 0,
+					Usage: "output NUM lines of context around changes",
+				},
+				cli.BoolFlag{
+					Name:  "detailed-exitcode",
+					Usage: "return a non-zero exit code 2 instead of 0 when there were changes detected AND the changes are synced successfully",
+				},
 				cli.StringFlag{
 					Name:  "args",
 					Value: "",
 					Usage: "pass args to helm exec",
 				},
 				cli.BoolFlag{
+					Name:  "retain-values-files",
+					Usage: "Stop cleaning up values files passed to Helm. Together with --log-level=debug, you can manually rerun helm commands as Helmfile did for debugging purpose",
+				},
+				cli.BoolFlag{
+					Name:  "include-tests",
+					Usage: "enable the diffing of the helm test hooks",
+				},
+				cli.BoolFlag{
 					Name:  "suppress-secrets",
 					Usage: "suppress secrets in the diff output. highly recommended to specify on CI/CD use-cases",
+				},
+				cli.BoolFlag{
+					Name:  "suppress-diff",
+					Usage: "suppress diff in the output. Usable in new installs",
 				},
 				cli.BoolFlag{
 					Name:  "skip-deps",
@@ -404,7 +471,13 @@ func main() {
 		{
 			Name:  "list",
 			Usage: "list releases defined in state file",
-			Flags: []cli.Flag{},
+			Flags: []cli.Flag{
+				cli.StringFlag{
+					Name:  "output",
+					Value: "",
+					Usage: "output releases list as a json string",
+				},
+			},
 			Action: action(func(run *app.App, c configImpl) error {
 				return run.ListReleases(c)
 			}),
@@ -441,10 +514,10 @@ func NewUrfaveCliConfigImpl(c *cli.Context) (configImpl, error) {
 			ops := strings.Split(optsSet[i], ",")
 			for j := range ops {
 				op := strings.SplitN(ops[j], "=", 2)
-				k := strings.Split(op[0], ".")
+				k := maputil.ParseKey(op[0])
 				v := op[1]
 
-				set = maputil.Set(set, k, v)
+				maputil.Set(set, k, v)
 			}
 		}
 		conf.set = set
@@ -453,16 +526,34 @@ func NewUrfaveCliConfigImpl(c *cli.Context) (configImpl, error) {
 	return conf, nil
 }
 
+func (c configImpl) Set() []string {
+	return c.c.StringSlice("set")
+}
+
+func (c configImpl) SkipRepos() bool {
+	return c.c.Bool("skip-repos")
+}
+
 func (c configImpl) Values() []string {
 	return c.c.StringSlice("values")
 }
 
 func (c configImpl) Args() string {
-	return c.c.String("args")
+	args := c.c.String("args")
+	enableHelmDebug := c.c.GlobalBool("debug")
+
+	if enableHelmDebug {
+		args = fmt.Sprintf("%s %s", args, "--debug")
+	}
+	return args
 }
 
 func (c configImpl) OutputDir() string {
 	return c.c.String("output-dir")
+}
+
+func (c configImpl) Validate() bool {
+	return c.c.Bool("validate")
 }
 
 func (c configImpl) Concurrency() int {
@@ -483,8 +574,20 @@ func (c configImpl) DetailedExitcode() bool {
 	return c.c.Bool("detailed-exitcode")
 }
 
+func (c configImpl) RetainValuesFiles() bool {
+	return c.c.Bool("retain-values-files")
+}
+
+func (c configImpl) IncludeTests() bool {
+	return c.c.Bool("include-tests")
+}
+
 func (c configImpl) SuppressSecrets() bool {
 	return c.c.Bool("suppress-secrets")
+}
+
+func (c configImpl) SuppressDiff() bool {
+	return c.c.Bool("suppress-diff")
 }
 
 // DeleteConfig
@@ -500,7 +603,16 @@ func (c configImpl) Cleanup() bool {
 }
 
 func (c configImpl) Timeout() int {
+	if !c.c.IsSet("timeout") {
+		return state.EmptyTimeout
+	}
 	return c.c.Int("timeout")
+}
+
+// ListConfig
+
+func (c configImpl) Output() string {
+	return c.c.String("output")
 }
 
 // GlobalConfig
@@ -525,16 +637,24 @@ func (c configImpl) Selectors() []string {
 	return c.c.GlobalStringSlice("selector")
 }
 
-func (c configImpl) Set() map[string]interface{} {
+func (c configImpl) StateValuesSet() map[string]interface{} {
 	return c.set
 }
 
-func (c configImpl) ValuesFiles() []string {
+func (c configImpl) StateValuesFiles() []string {
 	return c.c.GlobalStringSlice("state-values-file")
 }
 
 func (c configImpl) Interactive() bool {
 	return c.c.GlobalBool("interactive")
+}
+
+func (c configImpl) NoColor() bool {
+	return c.c.GlobalBool("no-color")
+}
+
+func (c configImpl) Context() int {
+	return c.c.Int("context")
 }
 
 func (c configImpl) Logger() *zap.SugaredLogger {
@@ -558,11 +678,11 @@ func action(do func(*app.App, configImpl) error) func(*cli.Context) error {
 
 		a := app.New(conf)
 
-		a.ErrorHandler = func(err error) error {
+		if err := do(a, conf); err != nil {
 			return toCliError(implCtx, err)
 		}
 
-		return do(a, conf)
+		return nil
 	}
 }
 

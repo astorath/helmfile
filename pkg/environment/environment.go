@@ -58,9 +58,28 @@ func (e *Environment) Merge(other *Environment) (*Environment, error) {
 	}
 	copy := e.DeepCopy()
 	if other != nil {
-		if err := mergo.Merge(&copy, other, mergo.WithOverride); err != nil {
+		if err := mergo.Merge(&copy, other, mergo.WithOverride, mergo.WithOverwriteWithEmptyValue); err != nil {
 			return nil, err
 		}
 	}
 	return &copy, nil
+}
+
+func (e *Environment) GetMergedValues() (map[string]interface{}, error) {
+	vals := map[string]interface{}{}
+
+	if err := mergo.Merge(&vals, e.Defaults, mergo.WithOverride, mergo.WithOverwriteWithEmptyValue); err != nil {
+		return nil, err
+	}
+
+	if err := mergo.Merge(&vals, e.Values, mergo.WithOverride, mergo.WithOverwriteWithEmptyValue); err != nil {
+		return nil, err
+	}
+
+	vals, err := maputil.CastKeysToStrings(vals)
+	if err != nil {
+		return nil, err
+	}
+
+	return vals, nil
 }

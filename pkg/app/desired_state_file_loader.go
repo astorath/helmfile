@@ -4,19 +4,24 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/roboll/helmfile/pkg/helmexec"
 	"path/filepath"
 	"sort"
 
 	"github.com/imdario/mergo"
 	"github.com/roboll/helmfile/pkg/environment"
-	"github.com/roboll/helmfile/pkg/helmexec"
 	"github.com/roboll/helmfile/pkg/state"
+	"github.com/variantdev/vals"
 	"go.uber.org/zap"
 )
 
+const (
+	DefaultHelmBinary = state.DefaultHelmBinary
+)
+
 type desiredStateLoader struct {
-	KubeContext string
-	Reverse     bool
+	overrideKubeContext string
+	overrideHelmBinary  string
 
 	env       string
 	namespace string
@@ -25,9 +30,10 @@ type desiredStateLoader struct {
 	fileExists func(string) (bool, error)
 	abs        func(string) (string, error)
 	glob       func(string) ([]string, error)
+	getHelm    func(*state.HelmState) helmexec.Interface
 
-	logger *zap.SugaredLogger
-	helm   helmexec.Interface
+	logger      *zap.SugaredLogger
+	valsRuntime vals.Evaluator
 }
 
 func (ld *desiredStateLoader) Load(f string, opts LoadOpts) (*state.HelmState, error) {
@@ -58,7 +64,7 @@ func (ld *desiredStateLoader) Load(f string, opts LoadOpts) (*state.HelmState, e
 		return nil, err
 	}
 
-	if ld.Reverse {
+	if opts.Reverse {
 		rev := func(i, j int) bool {
 			return j < i
 		}
@@ -66,18 +72,18 @@ func (ld *desiredStateLoader) Load(f string, opts LoadOpts) (*state.HelmState, e
 		sort.Slice(st.Helmfiles, rev)
 	}
 
-	if ld.KubeContext != "" {
+	if ld.overrideKubeContext != "" {
 		if st.HelmDefaults.KubeContext != "" {
 			return nil, errors.New("err: Cannot use option --kube-context and set attribute helmDefaults.kubeContext.")
 		}
-		st.HelmDefaults.KubeContext = ld.KubeContext
+		st.HelmDefaults.KubeContext = ld.overrideKubeContext
 	}
 
 	if ld.namespace != "" {
-		if st.Namespace != "" {
+		if st.OverrideNamespace != "" {
 			return nil, errors.New("err: Cannot use option --namespace and set attribute namespace.")
 		}
-		st.Namespace = ld.namespace
+		st.OverrideNamespace = ld.namespace
 	}
 
 	return st, nil
@@ -124,11 +130,24 @@ func (ld *desiredStateLoader) loadFileWithOverrides(inheritedEnv, overrodeEnv *e
 		)
 	}
 
-	return self, err
+	if err != nil {
+		return nil, err
+	}
+
+	for i, h := range self.Helmfiles {
+		if h.Path == f {
+			return nil, fmt.Errorf("%s contains a recursion into the same sub-helmfile at helmfiles[%d]", f, i)
+		}
+		if h.Path == "." {
+			return nil, fmt.Errorf("%s contains a recursion into the the directory containing this helmfile at helmfiles[%d]", f, i)
+		}
+	}
+
+	return self, nil
 }
 
 func (a *desiredStateLoader) underlying() *state.StateCreator {
-	c := state.NewCreator(a.logger, a.readFile, a.fileExists, a.abs, a.glob, a.helm)
+	c := state.NewCreator(a.logger, a.readFile, a.fileExists, a.abs, a.glob, a.valsRuntime, a.getHelm, a.overrideHelmBinary)
 	c.LoadFile = a.loadFile
 	return c
 }
@@ -154,7 +173,9 @@ func (a *desiredStateLoader) load(yaml []byte, baseDir, file string, evaluateBas
 }
 
 func (ld *desiredStateLoader) renderAndLoad(env, overrodeEnv *environment.Environment, baseDir, filename string, content []byte, evaluateBases bool) (*state.HelmState, error) {
-	parts := bytes.Split(content, []byte("\n---\n"))
+	// Allows part-splitting to work with CLRF-ed content
+	normalizedContent := bytes.ReplaceAll(content, []byte("\r\n"), []byte("\n"))
+	parts := bytes.Split(normalizedContent, []byte("\n---\n"))
 
 	var finalState *state.HelmState
 
@@ -186,6 +207,12 @@ func (ld *desiredStateLoader) renderAndLoad(env, overrodeEnv *environment.Enviro
 		)
 		if err != nil {
 			return nil, err
+		}
+
+		for i, r := range currentState.Releases {
+			if r.Chart == "" {
+				return nil, fmt.Errorf("error during %s parsing: encountered empty chart while reading release %q at index %d", id, r.Name, i)
+			}
 		}
 
 		if finalState == nil {

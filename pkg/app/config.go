@@ -10,8 +10,8 @@ type ConfigProvider interface {
 	KubeContext() string
 	Namespace() string
 	Selectors() []string
-	Set() map[string]interface{}
-	ValuesFiles() []string
+	StateValuesSet() map[string]interface{}
+	StateValuesFiles() []string
 	Env() string
 
 	loggingConfig
@@ -26,6 +26,7 @@ type DeprecatedChartsConfigProvider interface {
 
 type DepsConfigProvider interface {
 	Args() string
+	SkipRepos() bool
 }
 
 type ReposConfigProvider interface {
@@ -36,9 +37,20 @@ type ApplyConfigProvider interface {
 	Args() string
 
 	Values() []string
+	Set() []string
 	SkipDeps() bool
 
+	IncludeTests() bool
+
 	SuppressSecrets() bool
+	SuppressDiff() bool
+
+	DetailedExitcode() bool
+
+	NoColor() bool
+	Context() int
+
+	RetainValuesFiles() bool
 
 	concurrencyConfig
 	interactive
@@ -49,6 +61,7 @@ type SyncConfigProvider interface {
 	Args() string
 
 	Values() []string
+	Set() []string
 	SkipDeps() bool
 
 	concurrencyConfig
@@ -59,11 +72,17 @@ type DiffConfigProvider interface {
 	Args() string
 
 	Values() []string
+	Set() []string
 	SkipDeps() bool
 
+	IncludeTests() bool
+
 	SuppressSecrets() bool
+	SuppressDiff() bool
 
 	DetailedExitcode() bool
+	NoColor() bool
+	Context() int
 
 	concurrencyConfig
 }
@@ -99,6 +118,7 @@ type LintConfigProvider interface {
 	Args() string
 
 	Values() []string
+	Set() []string
 	SkipDeps() bool
 
 	concurrencyConfig
@@ -108,6 +128,8 @@ type TemplateConfigProvider interface {
 	Args() string
 
 	Values() []string
+	Set() []string
+	Validate() bool
 	SkipDeps() bool
 	OutputDir() string
 
@@ -133,4 +155,8 @@ type loggingConfig interface {
 
 type interactive interface {
 	Interactive() bool
+}
+
+type ListConfigProvider interface {
+	Output() string
 }
