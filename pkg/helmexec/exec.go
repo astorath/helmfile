@@ -1,16 +1,17 @@
 package helmexec
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/Masterminds/semver/v3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -22,13 +23,14 @@ type decryptedSecret struct {
 
 type execer struct {
 	helmBinary           string
-	version              Version
+	version              semver.Version
 	runner               Runner
 	logger               *zap.SugaredLogger
 	kubeContext          string
 	extra                []string
 	decryptedSecretMutex sync.Mutex
 	decryptedSecrets     map[string]*decryptedSecret
+	writeTempFile        func([]byte) (string, error)
 }
 
 func NewLogger(writer io.Writer, logLevel string) *zap.SugaredLogger {
@@ -48,62 +50,48 @@ func NewLogger(writer io.Writer, logLevel string) *zap.SugaredLogger {
 	return zap.New(core).Sugar()
 }
 
-func getHelmVersion(helmBinary string, logger *zap.SugaredLogger, runner Runner) Version {
+func parseHelmVersion(versionStr string) (semver.Version, error) {
+	if len(versionStr) == 0 {
+		return semver.Version{}, nil
+	}
 
-	// Autodetect from `helm verison`
-	bytes, err := runner.Execute(helmBinary, []string{"version", "--client", "--short"}, nil)
+	versionStr = strings.TrimLeft(versionStr, "Client: ")
+	versionStr = strings.TrimRight(versionStr, "\n")
+
+	ver, err := semver.NewVersion(versionStr)
 	if err != nil {
-		panic(err)
-	}
-
-	if bytes == nil || len(bytes) == 0 {
-		return Version{}
-	}
-
-	re := regexp.MustCompile("v(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)")
-	matches := re.FindStringSubmatch(string(bytes))
-
-	result := make(map[string]string)
-	for i, name := range re.SubexpNames() {
-		result[name] = matches[i]
-	}
-
-	major, err := strconv.Atoi(result["major"])
-	if err != nil {
-		panic(err)
-	}
-
-	minor, err := strconv.Atoi(result["minor"])
-	if err != nil {
-		panic(err)
-	}
-
-	patch, err := strconv.Atoi(result["patch"])
-	if err != nil {
-		panic(err)
+		return semver.Version{}, fmt.Errorf("error parsing helm version '%s'", versionStr)
 	}
 
 	// Support explicit helm3 opt-in via environment variable
-	if os.Getenv("HELMFILE_HELM3") != "" && major < 3 {
-		return Version{
-			Major: 3,
-			Minor: 0,
-			Patch: 0,
-		}
+	if os.Getenv("HELMFILE_HELM3") != "" && ver.Major() < 3 {
+		return *semver.MustParse("v3.0.0"), nil
 	}
 
-	return Version{
-		Major: major,
-		Minor: minor,
-		Patch: patch,
+	return *ver, nil
+}
+
+func getHelmVersion(helmBinary string, runner Runner) (semver.Version, error) {
+
+	// Autodetect from `helm version`
+	outBytes, err := runner.Execute(helmBinary, []string{"version", "--client", "--short"}, nil)
+	if err != nil {
+		return semver.Version{}, fmt.Errorf("error determining helm version: %w", err)
 	}
+
+	return parseHelmVersion(string(outBytes))
 }
 
 // New for running helm commands
 func New(helmBinary string, logger *zap.SugaredLogger, kubeContext string, runner Runner) *execer {
+	// TODO: proper error handling
+	version, err := getHelmVersion(helmBinary, runner)
+	if err != nil {
+		panic(err)
+	}
 	return &execer{
 		helmBinary:       helmBinary,
-		version:          getHelmVersion(helmBinary, logger, runner),
+		version:          version,
 		logger:           logger,
 		kubeContext:      kubeContext,
 		runner:           runner,
@@ -119,24 +107,46 @@ func (helm *execer) SetHelmBinary(bin string) {
 	helm.helmBinary = bin
 }
 
-func (helm *execer) AddRepo(name, repository, cafile, certfile, keyfile, username, password string) error {
+func (helm *execer) AddRepo(name, repository, cafile, certfile, keyfile, username, password string, managed string) error {
 	var args []string
+	var out []byte
+	var err error
 	if name == "" && repository != "" {
 		helm.logger.Infof("empty field name\n")
 		return fmt.Errorf("empty field name")
 	}
-	args = append(args, "repo", "add", name, repository)
-	if certfile != "" && keyfile != "" {
-		args = append(args, "--cert-file", certfile, "--key-file", keyfile)
+	switch managed {
+	case "acr":
+		helm.logger.Infof("Adding repo %v (acr)", name)
+		out, err = helm.azcli(name)
+	case "":
+		args = append(args, "repo", "add", name, repository)
+
+		// See https://github.com/helm/helm/pull/8777
+		if cons, err := semver.NewConstraint(">= 3.3.2"); err == nil {
+			if cons.Check(&helm.version) {
+				args = append(args, "--force-update")
+			}
+		} else {
+			panic(err)
+		}
+
+		if certfile != "" && keyfile != "" {
+			args = append(args, "--cert-file", certfile, "--key-file", keyfile)
+		}
+		if cafile != "" {
+			args = append(args, "--ca-file", cafile)
+		}
+		if username != "" && password != "" {
+			args = append(args, "--username", username, "--password", password)
+		}
+		helm.logger.Infof("Adding repo %v %v", name, repository)
+		out, err = helm.exec(args, map[string]string{})
+	default:
+		helm.logger.Errorf("ERROR: unknown type '%v' for repository %v", managed, name)
+		out = nil
+		err = nil
 	}
-	if cafile != "" {
-		args = append(args, "--ca-file", cafile)
-	}
-	if username != "" && password != "" {
-		args = append(args, "--username", username, "--password", password)
-	}
-	helm.logger.Infof("Adding repo %v %v", name, repository)
-	out, err := helm.exec(args, map[string]string{})
 	helm.info(out)
 	return err
 }
@@ -144,6 +154,23 @@ func (helm *execer) AddRepo(name, repository, cafile, certfile, keyfile, usernam
 func (helm *execer) UpdateRepo() error {
 	helm.logger.Info("Updating repo")
 	out, err := helm.exec([]string{"repo", "update"}, map[string]string{})
+	helm.info(out)
+	return err
+}
+
+func (helm *execer) RegistryLogin(repository string, username string, password string) error {
+	helm.logger.Info("Logging in to registry")
+	args := []string{
+		"registry",
+		"login",
+		repository,
+		"--username",
+		username,
+		"--password-stdin",
+	}
+	buffer := bytes.Buffer{}
+	buffer.Write([]byte(fmt.Sprintf("%s\n", password)))
+	out, err := helm.execStdIn(args, map[string]string{"HELM_EXPERIMENTAL_OCI": "1"}, &buffer)
 	helm.info(out)
 	return err
 }
@@ -174,7 +201,7 @@ func (helm *execer) SyncRelease(context HelmContext, name, chart string, flags .
 	}
 
 	out, err := helm.exec(append(append(preArgs, "upgrade", "--install", "--reset-values", name, chart), flags...), env)
-	helm.write(out)
+	helm.write(nil, out)
 	return err
 }
 
@@ -183,7 +210,7 @@ func (helm *execer) ReleaseStatus(context HelmContext, name string, flags ...str
 	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
 	out, err := helm.exec(append(append(preArgs, "status", name), flags...), env)
-	helm.write(out)
+	helm.write(nil, out)
 	return err
 }
 
@@ -210,7 +237,7 @@ func (helm *execer) List(context HelmContext, filter string, flags ...string) (s
 		lines = lines[1:]
 		out = []byte(strings.Join(lines, "\n"))
 	}
-	helm.write(out)
+	helm.write(nil, out)
 	return string(out), err
 }
 
@@ -270,16 +297,32 @@ func (helm *execer) DecryptSecret(context HelmContext, name string, flags ...str
 		defer secret.mutex.RUnlock()
 	}
 
-	tmpFile, err := ioutil.TempFile("", "secret")
-	if err != nil {
-		return "", err
+	tempFile := helm.writeTempFile
+
+	if tempFile == nil {
+		tempFile = func(content []byte) (string, error) {
+			tmpFile, err := ioutil.TempFile("", "secret")
+			if err != nil {
+				return "", err
+			}
+
+			_, err = tmpFile.Write(content)
+			if err != nil {
+				return "", err
+			}
+
+			return tmpFile.Name(), nil
+		}
 	}
-	_, err = tmpFile.Write(secret.bytes)
+
+	tmpFileName, err := tempFile(secret.bytes)
 	if err != nil {
 		return "", err
 	}
 
-	return tmpFile.Name(), err
+	helm.logger.Debugf("Decrypted %s into %s", absPath, tmpFileName)
+
+	return tmpFileName, err
 }
 
 func (helm *execer) TemplateRelease(name string, chart string, flags ...string) error {
@@ -292,12 +335,16 @@ func (helm *execer) TemplateRelease(name string, chart string, flags ...string) 
 	}
 
 	out, err := helm.exec(append(args, flags...), map[string]string{})
-	helm.write(out)
+	helm.write(nil, out)
 	return err
 }
 
 func (helm *execer) DiffRelease(context HelmContext, name, chart string, suppressDiff bool, flags ...string) error {
-	helm.logger.Infof("Comparing release=%v, chart=%v", name, chart)
+	if context.Writer != nil {
+		fmt.Fprintf(context.Writer, "Comparing release=%v, chart=%v\n", name, chart)
+	} else {
+		helm.logger.Infof("Comparing release=%v, chart=%v", name, chart)
+	}
 	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
 	out, err := helm.exec(append(append(preArgs, "diff", "upgrade", "--reset-values", "--allow-unreleased", name, chart), flags...), env)
@@ -315,13 +362,13 @@ func (helm *execer) DiffRelease(context HelmContext, name, chart string, suppres
 		case ExitError:
 			if e.ExitStatus() == 2 {
 				if !(suppressDiff) {
-					helm.write(out)
+					helm.write(context.Writer, out)
 				}
 				return err
 			}
 		}
 	} else if !(suppressDiff) {
-		helm.write(out)
+		helm.write(context.Writer, out)
 	}
 	return err
 }
@@ -329,7 +376,7 @@ func (helm *execer) DiffRelease(context HelmContext, name, chart string, suppres
 func (helm *execer) Lint(name, chart string, flags ...string) error {
 	helm.logger.Infof("Linting release=%v, chart=%v", name, chart)
 	out, err := helm.exec(append([]string{"lint", chart}, flags...), map[string]string{})
-	helm.write(out)
+	helm.write(nil, out)
 	return err
 }
 
@@ -340,12 +387,26 @@ func (helm *execer) Fetch(chart string, flags ...string) error {
 	return err
 }
 
+func (helm *execer) ChartPull(chart string, flags ...string) error {
+	helm.logger.Infof("Pulling %v", chart)
+	out, err := helm.exec(append([]string{"chart", "pull", chart}, flags...), map[string]string{"HELM_EXPERIMENTAL_OCI": "1"})
+	helm.info(out)
+	return err
+}
+
+func (helm *execer) ChartExport(chart string, path string, flags ...string) error {
+	helm.logger.Infof("Exporting %v", chart)
+	out, err := helm.exec(append([]string{"chart", "export", chart, "--destination", path}, flags...), map[string]string{"HELM_EXPERIMENTAL_OCI": "1"})
+	helm.info(out)
+	return err
+}
+
 func (helm *execer) DeleteRelease(context HelmContext, name string, flags ...string) error {
 	helm.logger.Infof("Deleting %v", name)
 	preArgs := context.GetTillerlessArgs(helm)
 	env := context.getTillerlessEnv()
 	out, err := helm.exec(append(append(preArgs, "delete", name), flags...), env)
-	helm.write(out)
+	helm.write(nil, out)
 	return err
 }
 
@@ -355,7 +416,7 @@ func (helm *execer) TestRelease(context HelmContext, name string, flags ...strin
 	env := context.getTillerlessEnv()
 	args := []string{"test", name}
 	out, err := helm.exec(append(append(preArgs, args...), flags...), env)
-	helm.write(out)
+	helm.write(nil, out)
 	return err
 }
 
@@ -365,13 +426,35 @@ func (helm *execer) exec(args []string, env map[string]string) ([]byte, error) {
 		cmdargs = append(cmdargs, helm.extra...)
 	}
 	if helm.kubeContext != "" {
-		cmdargs = append(cmdargs, "--kube-context", helm.kubeContext)
+		cmdargs = append([]string{"--kube-context", helm.kubeContext}, cmdargs...)
 	}
 	cmd := fmt.Sprintf("exec: %s %s", helm.helmBinary, strings.Join(cmdargs, " "))
 	helm.logger.Debug(cmd)
-	bytes, err := helm.runner.Execute(helm.helmBinary, cmdargs, env)
-	helm.logger.Debugf("%s: %s", cmd, bytes)
-	return bytes, err
+	outBytes, err := helm.runner.Execute(helm.helmBinary, cmdargs, env)
+	return outBytes, err
+}
+
+func (helm *execer) execStdIn(args []string, env map[string]string, stdin io.Reader) ([]byte, error) {
+	cmdargs := args
+	if len(helm.extra) > 0 {
+		cmdargs = append(cmdargs, helm.extra...)
+	}
+	if helm.kubeContext != "" {
+		cmdargs = append([]string{"--kube-context", helm.kubeContext}, cmdargs...)
+	}
+	cmd := fmt.Sprintf("exec: %s %s", helm.helmBinary, strings.Join(cmdargs, " "))
+	helm.logger.Debug(cmd)
+	outBytes, err := helm.runner.ExecuteStdIn(helm.helmBinary, cmdargs, env, stdin)
+	return outBytes, err
+}
+
+func (helm *execer) azcli(name string) ([]byte, error) {
+	cmdargs := append(strings.Split("acr helm repo add --name", " "), name)
+	cmd := fmt.Sprintf("exec: az %s", strings.Join(cmdargs, " "))
+	helm.logger.Debug(cmd)
+	outBytes, err := helm.runner.Execute("az", cmdargs, map[string]string{})
+	helm.logger.Debugf("%s: %s", cmd, outBytes)
+	return outBytes, err
 }
 
 func (helm *execer) info(out []byte) {
@@ -380,20 +463,28 @@ func (helm *execer) info(out []byte) {
 	}
 }
 
-func (helm *execer) write(out []byte) {
+func (helm *execer) write(w io.Writer, out []byte) {
 	if len(out) > 0 {
-		fmt.Printf("%s\n", out)
+		if w == nil {
+			w = os.Stdout
+		}
+		fmt.Fprintf(w, "%s\n", out)
 	}
 }
 
 func (helm *execer) IsHelm3() bool {
-	return helm.version.Major == 3
+	return helm.version.Major() == 3
 }
 
 func (helm *execer) GetVersion() Version {
-	return helm.version
+	return Version{
+		Major: int(helm.version.Major()),
+		Minor: int(helm.version.Minor()),
+		Patch: int(helm.version.Patch()),
+	}
 }
 
-func (helm *execer) IsVersionAtLeast(major int, minor int) bool {
-	return helm.version.Major >= major && helm.version.Minor >= minor
+func (helm *execer) IsVersionAtLeast(versionStr string) bool {
+	ver := semver.MustParse(versionStr)
+	return helm.version.Equal(ver) || helm.version.GreaterThan(ver)
 }

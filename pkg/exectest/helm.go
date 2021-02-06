@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/roboll/helmfile/pkg/helmexec"
 )
 
@@ -30,7 +31,7 @@ type Helm struct {
 	Diffed               []Release
 	FailOnUnexpectedDiff bool
 	FailOnUnexpectedList bool
-	Version              *helmexec.Version
+	Version              *semver.Version
 
 	UpdateDepsCallbacks map[string]func(string) error
 
@@ -81,11 +82,14 @@ func (helm *Helm) SetExtraArgs(args ...string) {
 func (helm *Helm) SetHelmBinary(bin string) {
 	return
 }
-func (helm *Helm) AddRepo(name, repository, cafile, certfile, keyfile, username, password string) error {
-	helm.Repo = []string{name, repository, cafile, certfile, keyfile, username, password}
+func (helm *Helm) AddRepo(name, repository, cafile, certfile, keyfile, username, password string, managed string) error {
+	helm.Repo = []string{name, repository, cafile, certfile, keyfile, username, password, managed}
 	return nil
 }
 func (helm *Helm) UpdateRepo() error {
+	return nil
+}
+func (helm *Helm) RegistryLogin(name string, username string, password string) error {
 	return nil
 }
 func (helm *Helm) SyncRelease(context helmexec.HelmContext, name, chart string, flags ...string) error {
@@ -157,25 +161,31 @@ func (helm *Helm) Lint(name, chart string, flags ...string) error {
 func (helm *Helm) TemplateRelease(name, chart string, flags ...string) error {
 	return nil
 }
-
+func (helm *Helm) ChartPull(chart string, flags ...string) error {
+	return nil
+}
+func (helm *Helm) ChartExport(chart string, path string, flags ...string) error {
+	return nil
+}
 func (helm *Helm) IsHelm3() bool {
 	return false
 }
 
 func (helm *Helm) GetVersion() helmexec.Version {
-	if helm.Version != nil {
-		return *helm.Version
+	return helmexec.Version{
+		Major: int(helm.Version.Major()),
+		Minor: int(helm.Version.Minor()),
+		Patch: int(helm.Version.Patch()),
 	}
-
-	return helmexec.Version{}
 }
 
-func (helm *Helm) IsVersionAtLeast(major int, minor int) bool {
+func (helm *Helm) IsVersionAtLeast(versionStr string) bool {
 	if helm.Version == nil {
 		return false
 	}
 
-	return helm.Version.Major >= major && minor >= helm.Version.Minor
+	ver := semver.MustParse(versionStr)
+	return helm.Version.Equal(ver) || helm.Version.GreaterThan(ver)
 }
 
 func (helm *Helm) sync(m *sync.Mutex, f func()) {

@@ -149,7 +149,7 @@ func Parse(goGetterSrc string) (*Source, error) {
 	}, nil
 }
 
-func (r *Remote) Fetch(goGetterSrc string) (string, error) {
+func (r *Remote) Fetch(goGetterSrc string, cacheDirOpt ...string) (string, error) {
 	u, err := Parse(goGetterSrc)
 	if err != nil {
 		return "", err
@@ -167,6 +167,11 @@ func (r *Remote) Fetch(goGetterSrc string) (string, error) {
 
 	// This should be shared across variant commands, so that they can share cache for the shared imports
 	cacheBaseDir := DefaultCacheDir
+	if len(cacheDirOpt) == 1 {
+		cacheBaseDir = cacheDirOpt[0]
+	} else if len(cacheDirOpt) > 0 {
+		return "", fmt.Errorf("[bug] cacheDirOpt's length: want 0 or 1, got %d", len(cacheDirOpt))
+	}
 
 	query := u.RawQuery
 
@@ -259,4 +264,16 @@ func (g *GoGetter) Get(wd, src, dst string) error {
 	}
 
 	return nil
+}
+
+func NewRemote(logger *zap.SugaredLogger, homeDir string, readFile func(string) ([]byte, error), dirExists func(string) bool, fileExists func(string) bool) *Remote {
+	remote := &Remote{
+		Logger:     logger,
+		Home:       homeDir,
+		Getter:     &GoGetter{Logger: logger},
+		ReadFile:   readFile,
+		DirExists:  dirExists,
+		FileExists: fileExists,
+	}
+	return remote
 }
