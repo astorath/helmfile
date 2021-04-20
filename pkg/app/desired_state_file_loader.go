@@ -25,6 +25,7 @@ type desiredStateLoader struct {
 
 	env       string
 	namespace string
+	chart     string
 
 	readFile          func(string) ([]byte, error)
 	deleteFile        func(string) error
@@ -72,9 +73,6 @@ func (ld *desiredStateLoader) Load(f string, opts LoadOpts) (*state.HelmState, e
 	}
 
 	if ld.overrideKubeContext != "" {
-		if st.HelmDefaults.KubeContext != "" {
-			return nil, errors.New("err: Cannot use option --kube-context and set attribute helmDefaults.kubeContext.")
-		}
 		st.HelmDefaults.KubeContext = ld.overrideKubeContext
 	}
 
@@ -83,6 +81,13 @@ func (ld *desiredStateLoader) Load(f string, opts LoadOpts) (*state.HelmState, e
 			return nil, errors.New("err: Cannot use option --namespace and set attribute namespace.")
 		}
 		st.OverrideNamespace = ld.namespace
+	}
+
+	if ld.chart != "" {
+		if st.OverrideChart != "" {
+			return nil, errors.New("err: Cannot use option --chart and set attribute chart.")
+		}
+		st.OverrideChart = ld.chart
 	}
 
 	return st, nil

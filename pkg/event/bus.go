@@ -2,7 +2,6 @@ package event
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/roboll/helmfile/pkg/environment"
@@ -12,11 +11,12 @@ import (
 )
 
 type Hook struct {
-	Name     string   `yaml:"name"`
-	Events   []string `yaml:"events"`
-	Command  string   `yaml:"command"`
-	Args     []string `yaml:"args"`
-	ShowLogs bool     `yaml:"showlogs"`
+	Name     string            `yaml:"name"`
+	Events   []string          `yaml:"events"`
+	Command  string            `yaml:"command"`
+	Kubectl  map[string]string `yaml:"kubectlApply,omitempty"`
+	Args     []string          `yaml:"args"`
+	ShowLogs bool              `yaml:"showlogs"`
 }
 
 type event struct {
@@ -31,6 +31,7 @@ type Bus struct {
 	BasePath      string
 	StateFilePath string
 	Namespace     string
+	Chart         string
 
 	Env environment.Environment
 
@@ -61,10 +62,31 @@ func (bus *Bus) Trigger(evt string, evtErr error, context map[string]interface{}
 
 		name := hook.Name
 		if name == "" {
-			name = hook.Command
+			if hook.Kubectl != nil {
+				name = "kubectlApply"
+			} else {
+				name = hook.Command
+			}
 		}
 
-		fmt.Fprintf(os.Stderr, "%s: basePath=%s\n", bus.StateFilePath, bus.BasePath)
+		if hook.Kubectl != nil {
+			if hook.Command != "" {
+				bus.Logger.Warnf("warn: ignoring command '%s' given within a kubectlApply hook", hook.Command)
+			}
+			hook.Command = "kubectl"
+			if val, found := hook.Kubectl["filename"]; found {
+				if _, found := hook.Kubectl["kustomize"]; found {
+					return false, fmt.Errorf("hook[%s]: kustomize & filename cannot be used together", name)
+				}
+				hook.Args = append([]string{"apply", "-f"}, val)
+			} else if val, found := hook.Kubectl["kustomize"]; found {
+				hook.Args = append([]string{"apply", "-k"}, val)
+			} else {
+				return false, fmt.Errorf("hook[%s]: either kustomize or filename must be given", name)
+			}
+		}
+
+		bus.Logger.Debugf("hook[%s]: stateFilePath=%s, basePath=%s\n", name, bus.StateFilePath, bus.BasePath)
 
 		data := map[string]interface{}{
 			"Environment": bus.Env,

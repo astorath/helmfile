@@ -17,9 +17,10 @@ func (st *HelmState) Values() map[string]interface{} {
 }
 
 func (st *HelmState) createReleaseTemplateData(release *ReleaseSpec, vals map[string]interface{}) releaseTemplateData {
-	return releaseTemplateData{
+	tmplData := releaseTemplateData{
 		Environment: st.Env,
 		Namespace:   st.OverrideNamespace,
+		Chart:       st.OverrideChart,
 		Values:      vals,
 		Release: releaseTemplateDataRelease{
 			Name:      release.Name,
@@ -28,6 +29,8 @@ func (st *HelmState) createReleaseTemplateData(release *ReleaseSpec, vals map[st
 			Labels:    release.Labels,
 		},
 	}
+	tmplData.StateValues = &tmplData.Values
+	return tmplData
 }
 
 func getBoolRefFromStringTemplate(templateRef string) (*bool, error) {

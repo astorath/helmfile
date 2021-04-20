@@ -54,6 +54,7 @@ type ReleaseSetSpec struct {
 	DeprecatedContext  string            `yaml:"context,omitempty"`
 	DeprecatedReleases []ReleaseSpec     `yaml:"charts,omitempty"`
 	OverrideNamespace  string            `yaml:"namespace,omitempty"`
+	OverrideChart      string            `yaml:"chart,omitempty"`
 	Repositories       []RepositorySpec  `yaml:"repositories,omitempty"`
 	CommonLabels       map[string]string `yaml:"commonLabels,omitempty"`
 	Releases           []ReleaseSpec     `yaml:"releases,omitempty"`
@@ -130,6 +131,8 @@ type HelmSpec struct {
 	Devel bool `yaml:"devel"`
 	// Wait, if set to true, will wait until all Pods, PVCs, Services, and minimum number of Pods of a Deployment are in a ready state before marking the release as successful
 	Wait bool `yaml:"wait"`
+	// WaitForJobs, if set and --wait enabled, will wait until all Jobs have been completed before marking the release as successful. It will wait for as long as --timeout
+	WaitForJobs bool `yaml:"waitForJobs"`
 	// Timeout is the time in seconds to wait for any individual Kubernetes operation (like Jobs for hooks, and waits on pod/pvc/svc/deployment readiness) (default 300)
 	Timeout int `yaml:"timeout"`
 	// RecreatePods, when set to true, instruct helmfile to perform pods restart for the resource if applicable
@@ -186,6 +189,8 @@ type ReleaseSpec struct {
 	Devel *bool `yaml:"devel,omitempty"`
 	// Wait, if set to true, will wait until all Pods, PVCs, Services, and minimum number of Pods of a Deployment are in a ready state before marking the release as successful
 	Wait *bool `yaml:"wait,omitempty"`
+	// WaitForJobs, if set and --wait enabled, will wait until all Jobs have been completed before marking the release as successful. It will wait for as long as --timeout
+	WaitForJobs *bool `yaml:"waitForJobs,omitempty"`
 	// Timeout is the time in seconds to wait for any individual Kubernetes operation (like Jobs for hooks, and waits on pod/pvc/svc/deployment readiness) (default 300)
 	Timeout *int `yaml:"timeout,omitempty"`
 	// RecreatePods, when set to true, instruct helmfile to perform pods restart for the resource if applicable
@@ -508,8 +513,16 @@ func (st *HelmState) prepareSyncReleases(helm helmexec.Interface, additionalValu
 					}
 				}
 
+				if opts.SkipCRDs {
+					flags = append(flags, "--skip-crds")
+				}
+
 				if opts.Wait {
 					flags = append(flags, "--wait")
+				}
+
+				if opts.WaitForJobs {
+					flags = append(flags, "--wait-for-jobs")
 				}
 
 				if len(errs) > 0 {
@@ -586,7 +599,9 @@ func (st *HelmState) DetectReleasesToBeDeleted(helm helmexec.Interface, releases
 type SyncOpts struct {
 	Set         []string
 	SkipCleanup bool
+	SkipCRDs    bool
 	Wait        bool
+	WaitForJobs bool
 }
 
 type SyncOpt interface{ Apply(*SyncOpts) }
@@ -885,7 +900,10 @@ type ChartPrepareOptions struct {
 	SkipRepos     bool
 	SkipDeps      bool
 	SkipResolve   bool
+	IncludeCRDs   *bool
 	Wait          bool
+	WaitForJobs   bool
+	OutputDir     string
 }
 
 type chartPrepareResult struct {
@@ -988,6 +1006,9 @@ func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurre
 		},
 		func(workerIndex int) {
 			for release := range jobQueue {
+				if st.OverrideChart != "" {
+					release.Chart = st.OverrideChart
+				}
 				// Call user-defined `prepare` hooks to create/modify local charts to be used by
 				// the later process.
 				//
@@ -1047,6 +1068,13 @@ func (st *HelmState) PrepareCharts(helm helmexec.Interface, dir string, concurre
 					if skipDeps {
 						chartifyOpts.SkipDeps = true
 					}
+
+					includeCRDs := true
+					if opts.IncludeCRDs != nil {
+						includeCRDs = *opts.IncludeCRDs
+					}
+
+					chartifyOpts.IncludeCRDs = includeCRDs
 
 					out, err := c.Chartify(release.Name, chartPath, chartify.WithChartifyOpts(chartifyOpts))
 					if err != nil {
@@ -1514,7 +1542,7 @@ type diffPrepareResult struct {
 	upgradeDueToSkippedDiff bool
 }
 
-func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValues []string, concurrency int, detailedExitCode, includeTests, suppressSecrets bool, opt ...DiffOpt) ([]diffPrepareResult, []error) {
+func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValues []string, concurrency int, detailedExitCode, includeTests, suppressSecrets bool, showSecrets bool, opt ...DiffOpt) ([]diffPrepareResult, []error) {
 	opts := &DiffOpts{}
 	for _, o := range opt {
 		o.Apply(opts)
@@ -1617,6 +1645,10 @@ func (st *HelmState) prepareDiffReleases(helm helmexec.Interface, additionalValu
 
 				if suppressSecrets {
 					flags = append(flags, "--suppress-secrets")
+				}
+
+				if showSecrets {
+					flags = append(flags, "--show-secrets")
 				}
 
 				if opts.NoColor {
@@ -1724,13 +1756,13 @@ type DiffOpt interface{ Apply(*DiffOpts) }
 // For example, terraform-provider-helmfile runs a helmfile-diff on `terraform plan` and another on `terraform apply`.
 // `terraform`, by design, fails when helmfile-diff outputs were not equivalent.
 // Stabilized helmfile-diff output rescues that.
-func (st *HelmState) DiffReleases(helm helmexec.Interface, additionalValues []string, workerLimit int, detailedExitCode, includeTests, suppressSecrets, suppressDiff, triggerCleanupEvents bool, opt ...DiffOpt) ([]ReleaseSpec, []error) {
+func (st *HelmState) DiffReleases(helm helmexec.Interface, additionalValues []string, workerLimit int, detailedExitCode, includeTests, suppressSecrets, showSecrets, suppressDiff, triggerCleanupEvents bool, opt ...DiffOpt) ([]ReleaseSpec, []error) {
 	opts := &DiffOpts{}
 	for _, o := range opt {
 		o.Apply(opts)
 	}
 
-	preps, prepErrs := st.prepareDiffReleases(helm, additionalValues, workerLimit, detailedExitCode, includeTests, suppressSecrets, opts)
+	preps, prepErrs := st.prepareDiffReleases(helm, additionalValues, workerLimit, detailedExitCode, includeTests, suppressSecrets, showSecrets, opts)
 
 	defer func() {
 		if opts.SkipCleanup {
@@ -2047,6 +2079,7 @@ func (st *HelmState) triggerGlobalReleaseEvent(evt string, evtErr error, helmfil
 		StateFilePath: st.FilePath,
 		BasePath:      st.basePath,
 		Namespace:     st.OverrideNamespace,
+		Chart:         st.OverrideChart,
 		Env:           st.Env,
 		Logger:        st.logger,
 		ReadFile:      st.readFile,
@@ -2079,6 +2112,7 @@ func (st *HelmState) triggerReleaseEvent(evt string, evtErr error, r *ReleaseSpe
 		StateFilePath: st.FilePath,
 		BasePath:      st.basePath,
 		Namespace:     st.OverrideNamespace,
+		Chart:         st.OverrideChart,
 		Env:           st.Env,
 		Logger:        st.logger,
 		ReadFile:      st.readFile,
@@ -2099,9 +2133,26 @@ func (st *HelmState) ResolveDeps() (*HelmState, error) {
 
 // UpdateDeps wrapper for updating dependencies on the releases
 func (st *HelmState) UpdateDeps(helm helmexec.Interface) []error {
+	var selected []ReleaseSpec
+
+	if len(st.Selectors) > 0 {
+		var err error
+
+		// This and releasesNeedCharts ensures that we run operations like helm-dep-build and prepare-hook calls only on
+		// releases that are (1) selected by the selectors and (2) to be installed.
+		selected, err = st.GetSelectedReleasesWithOverrides()
+		if err != nil {
+			return []error{err}
+		}
+	} else {
+		selected = st.Releases
+	}
+
+	releases := releasesNeedCharts(selected)
+
 	var errs []error
 
-	for _, release := range st.Releases {
+	for _, release := range releases {
 		if st.directoryExistsAt(release.Chart) {
 			if err := helm.UpdateDeps(release.Chart); err != nil {
 				errs = append(errs, err)
@@ -2206,6 +2257,8 @@ func (st *HelmState) connectionFlags(helm helmexec.Interface, release *ReleaseSp
 
 		if release.KubeContext != "" {
 			flags = append(flags, "--kube-context", release.KubeContext)
+		} else if st.Environments[st.Env.Name].KubeContext != "" {
+			flags = append(flags, "--kube-context", st.Environments[st.Env.Name].KubeContext)
 		} else if st.HelmDefaults.KubeContext != "" {
 			flags = append(flags, "--kube-context", st.HelmDefaults.KubeContext)
 		}
@@ -2241,6 +2294,10 @@ func (st *HelmState) flagsForUpgrade(helm helmexec.Interface, release *ReleaseSp
 
 	if release.Wait != nil && *release.Wait || release.Wait == nil && st.HelmDefaults.Wait {
 		flags = append(flags, "--wait")
+	}
+
+	if release.WaitForJobs != nil && *release.WaitForJobs || release.WaitForJobs == nil && st.HelmDefaults.WaitForJobs {
+		flags = append(flags, "--wait-for-jobs")
 	}
 
 	flags = append(flags, st.timeoutFlags(helm, release)...)
@@ -2401,9 +2458,21 @@ func (st *HelmState) flagsForLint(helm helmexec.Interface, release *ReleaseSpec,
 	return flags, files, nil
 }
 
-func (st *HelmState) RenderReleaseValuesFileToBytes(release *ReleaseSpec, path string) ([]byte, error) {
+func (st *HelmState) newReleaseTemplateData(release *ReleaseSpec) releaseTemplateData {
 	vals := st.Values()
 	templateData := st.createReleaseTemplateData(release, vals)
+
+	return templateData
+}
+
+func (st *HelmState) newReleaseTemplateFuncMap(dir string) template.FuncMap {
+	r := tmpl.NewFileRenderer(st.readFile, dir, nil)
+
+	return r.Context.CreateFuncMap()
+}
+
+func (st *HelmState) RenderReleaseValuesFileToBytes(release *ReleaseSpec, path string) ([]byte, error) {
+	templateData := st.newReleaseTemplateData(release)
 
 	r := tmpl.NewFileRenderer(st.readFile, filepath.Dir(path), templateData)
 	rawBytes, err := r.RenderToBytes(path)
@@ -2574,7 +2643,7 @@ func (st *HelmState) generateVanillaValuesFiles(release *ReleaseSpec) ([]string,
 }
 
 func (st *HelmState) generateSecretValuesFiles(helm helmexec.Interface, release *ReleaseSpec, workerIndex int) ([]string, error) {
-	var generatedFiles []string
+	var generatedDecryptedFiles []interface{}
 
 	for _, v := range release.Secrets {
 		var (
@@ -2625,8 +2694,16 @@ func (st *HelmState) generateSecretValuesFiles(helm helmexec.Interface, release 
 		if err != nil {
 			return nil, err
 		}
+		defer func() {
+			_ = os.Remove(valfile)
+		}()
 
-		generatedFiles = append(generatedFiles, valfile)
+		generatedDecryptedFiles = append(generatedDecryptedFiles, valfile)
+	}
+
+	generatedFiles, err := st.generateTemporaryReleaseValuesFiles(release, generatedDecryptedFiles, release.MissingFileHandler)
+	if err != nil {
+		return nil, err
 	}
 
 	return generatedFiles, nil

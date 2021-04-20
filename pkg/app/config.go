@@ -9,6 +9,7 @@ type ConfigProvider interface {
 	FileOrDir() string
 	KubeContext() string
 	Namespace() string
+	Chart() string
 	Selectors() []string
 	StateValuesSet() map[string]interface{}
 	StateValuesFiles() []string
@@ -38,12 +39,15 @@ type ApplyConfigProvider interface {
 
 	Values() []string
 	Set() []string
+	SkipCRDs() bool
 	SkipDeps() bool
 	Wait() bool
+	WaitForJobs() bool
 
 	IncludeTests() bool
 
 	SuppressSecrets() bool
+	ShowSecrets() bool
 	SuppressDiff() bool
 
 	DetailedExitcode() bool
@@ -55,6 +59,9 @@ type ApplyConfigProvider interface {
 	SkipCleanup() bool
 	SkipDiffOnInstall() bool
 
+	SkipNeeds() bool
+	IncludeNeeds() bool
+
 	concurrencyConfig
 	interactive
 	loggingConfig
@@ -65,8 +72,13 @@ type SyncConfigProvider interface {
 
 	Values() []string
 	Set() []string
+	SkipCRDs() bool
 	SkipDeps() bool
 	Wait() bool
+	WaitForJobs() bool
+
+	SkipNeeds() bool
+	IncludeNeeds() bool
 
 	concurrencyConfig
 	loggingConfig
@@ -77,12 +89,17 @@ type DiffConfigProvider interface {
 
 	Values() []string
 	Set() []string
+	SkipCRDs() bool
 	SkipDeps() bool
 
 	IncludeTests() bool
 
 	SuppressSecrets() bool
+	ShowSecrets() bool
 	SuppressDiff() bool
+
+	SkipNeeds() bool
+	IncludeNeeds() bool
 
 	DetailedExitcode() bool
 	NoColor() bool
@@ -129,6 +146,13 @@ type LintConfigProvider interface {
 	concurrencyConfig
 }
 
+type FetchConfigProvider interface {
+	SkipDeps() bool
+	OutputDir() string
+
+	concurrencyConfig
+}
+
 type TemplateConfigProvider interface {
 	Args() string
 
@@ -140,6 +164,7 @@ type TemplateConfigProvider interface {
 	SkipCleanup() bool
 	OutputDir() string
 	IncludeCRDs() bool
+	IncludeNeeds() bool
 
 	concurrencyConfig
 }

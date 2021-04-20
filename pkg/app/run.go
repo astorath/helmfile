@@ -2,13 +2,14 @@ package app
 
 import (
 	"fmt"
-	"github.com/roboll/helmfile/pkg/argparser"
-	"github.com/roboll/helmfile/pkg/helmexec"
-	"github.com/roboll/helmfile/pkg/state"
 	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/roboll/helmfile/pkg/argparser"
+	"github.com/roboll/helmfile/pkg/helmexec"
+	"github.com/roboll/helmfile/pkg/state"
 )
 
 type Run struct {
@@ -49,13 +50,20 @@ func (r *Run) withPreparedCharts(helmfileCommand string, opts state.ChartPrepare
 	}
 
 	// Create tmp directory and bail immediately if it fails
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		return err
+	var dir string
+	if len(opts.OutputDir) == 0 {
+		tempDir, err := ioutil.TempDir("", "helmfile*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(tempDir)
+		dir = tempDir
+	} else {
+		dir = opts.OutputDir
+		fmt.Printf("Charts will be downloaded to: %s\n", dir)
 	}
-	defer os.RemoveAll(dir)
 
-	if _, err = r.state.TriggerGlobalPrepareEvent(helmfileCommand); err != nil {
+	if _, err := r.state.TriggerGlobalPrepareEvent(helmfileCommand); err != nil {
 		return err
 	}
 
@@ -82,7 +90,7 @@ func (r *Run) withPreparedCharts(helmfileCommand string, opts state.ChartPrepare
 
 	f()
 
-	_, err = r.state.TriggerGlobalCleanupEvent(helmfileCommand)
+	_, err := r.state.TriggerGlobalCleanupEvent(helmfileCommand)
 
 	return err
 }
@@ -109,104 +117,9 @@ func (r *Run) DeprecatedSyncCharts(c DeprecatedChartsConfigProvider) []error {
 	return errs
 }
 
-func (r *Run) Status(c StatusesConfigProvider) []error {
-	workers := c.Concurrency()
-
-	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
-
-	return r.state.ReleaseStatuses(r.helm, workers)
-}
-
-func (a *App) diff(r *Run, c DiffConfigProvider) (*string, bool, bool, []error) {
-	st := r.state
-
-	allReleases := st.GetReleasesWithOverrides()
-
-	toDiff, err := a.getSelectedReleases(r)
-	if err != nil {
-		return nil, false, false, []error{err}
-	}
-
-	if len(toDiff) == 0 {
-		return nil, false, false, nil
-	}
-
-	// Do build deps and prepare only on selected releases so that we won't waste time
-	// on running various helm commands on unnecessary releases
-	st.Releases = toDiff
-
-	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
-
-	opts := &state.DiffOpts{
-		Context: c.Context(),
-		NoColor: c.NoColor(),
-		Set:     c.Set(),
-	}
-
-	// Validate all releases for missing `needs` targets
-	st.Releases = allReleases
-
-	if _, err := st.PlanReleases(false); err != nil {
-		return nil, false, false, []error{err}
-	}
-
-	// Diff only targeted releases
-
-	st.Releases = toDiff
-
-	filtered := &Run{
-		state: st,
-		helm:  r.helm,
-		ctx:   r.ctx,
-		Ask:   r.Ask,
-	}
-
-	infoMsg, updated, deleted, errs := filtered.diff(true, c.DetailedExitcode(), c, opts)
-
-	return infoMsg, true, len(deleted) > 0 || len(updated) > 0, errs
-}
-
-func (a *App) test(r *Run, c TestConfigProvider) []error {
-	cleanup := c.Cleanup()
-	timeout := c.Timeout()
-	concurrency := c.Concurrency()
-
-	st := r.state
-
-	toTest, err := a.getSelectedReleases(r)
-	if err != nil {
-		return []error{err}
-	}
-
-	if len(toTest) == 0 {
-		return nil
-	}
-
-	// Do test only on selected releases, because that's what the user intended
-	// with conditions and selectors
-	st.Releases = toTest
-
-	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
-
-	return st.TestReleases(r.helm, cleanup, timeout, concurrency, state.Logs(c.Logs()))
-}
-
-func (r *Run) Lint(c LintConfigProvider) []error {
+func (r *Run) diff(triggerCleanupEvent bool, detailedExitCode bool, c DiffConfigProvider, diffOpts *state.DiffOpts) (*string, map[string]state.ReleaseSpec, map[string]state.ReleaseSpec, []error) {
 	st := r.state
 	helm := r.helm
-
-	values := c.Values()
-	args := argparser.GetArgs(c.Args(), st)
-	workers := c.Concurrency()
-	opts := &state.LintOpts{
-		Set: c.Set(),
-	}
-	return st.LintReleases(helm, values, args, workers, opts)
-}
-
-func (run *Run) diff(triggerCleanupEvent bool, detailedExitCode bool, c DiffConfigProvider, diffOpts *state.DiffOpts) (*string, map[string]state.ReleaseSpec, map[string]state.ReleaseSpec, []error) {
-	st := run.state
-	helm := run.helm
 
 	var changedReleases []state.ReleaseSpec
 	var deletingReleases []state.ReleaseSpec
@@ -214,7 +127,7 @@ func (run *Run) diff(triggerCleanupEvent bool, detailedExitCode bool, c DiffConf
 
 	// TODO Better way to detect diff on only filtered releases
 	{
-		changedReleases, planningErrs = st.DiffReleases(helm, c.Values(), c.Concurrency(), detailedExitCode, c.IncludeTests(), c.SuppressSecrets(), c.SuppressDiff(), triggerCleanupEvent, diffOpts)
+		changedReleases, planningErrs = st.DiffReleases(helm, c.Values(), c.Concurrency(), detailedExitCode, c.IncludeTests(), c.SuppressSecrets(), c.ShowSecrets(), c.SuppressDiff(), triggerCleanupEvent, diffOpts)
 
 		var err error
 		deletingReleases, err = st.DetectReleasesToBeDeletedForSync(helm, st.Releases)

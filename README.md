@@ -88,6 +88,8 @@ helmDefaults:
   verify: true
   # wait for k8s resources via --wait. (default false)
   wait: true
+  # if set and --wait enabled, will wait until all Jobs have been completed before marking the release as successful. It will wait for as long as --timeout (default false, Implemented in Helm3.5)
+  waitForJobs: true
   # time in seconds to wait for any individual Kubernetes operation (like Jobs for hooks, and waits on pod/pvc/svc/deployment readiness) (default 300)
   timeout: 600
   # performs pods restart for the resource if applicable (default false)
@@ -169,9 +171,10 @@ releases:
     # will attempt to decrypt it using helm-secrets plugin
     secrets:
       - vault_secret.yaml
-    # Override helmDefaults options for verify, wait, timeout, recreatePods and force.
+    # Override helmDefaults options for verify, wait, waitForJobs, timeout, recreatePods and force.
     verify: true
     wait: true
+    waitForJobs: true
     timeout: 60
     recreatePods: true
     force: false
@@ -295,6 +298,8 @@ environments:
     # Use "Warn", "Info", or "Debug" if you want helmfile to not fail when a values file is missing, while just leaving
     # a message about the missing file at the log-level.
     missingFileHandler: Error
+    # kubeContext to use for this environment
+    kubeContext: kube-context
 
 #
 # Advanced Configuration: Layering
@@ -470,6 +475,7 @@ COMMANDS:
    test          test releases from state file (helm test)
    build         output compiled helmfile state(s) as YAML
    list          list releases defined in state file
+   fetch         fetch charts from state file
    version       Show the version for Helmfile.
    help, h       Shows a list of commands or help for one command
 
@@ -566,6 +572,11 @@ Use `--cleanup` to delete pods upon completion.
 ### lint
 
 The `helmfile lint` sub-command runs a `helm lint` across all of the charts/releases defined in the manifest. Non local charts will be fetched into a temporary folder which will be deleted once the task is completed.
+
+### fetch
+
+The `helmfile fetch` sub-command downloads or copies local charts to a local directory for debug purpose. The local directory
+must be specified with `--output-dir`.
 
 ## Paths Overview
 

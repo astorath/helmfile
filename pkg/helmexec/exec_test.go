@@ -182,9 +182,9 @@ func Test_SyncRelease(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
-	helm.SyncRelease(HelmContext{}, "release", "chart", "--timeout 10", "--wait")
+	helm.SyncRelease(HelmContext{}, "release", "chart", "--timeout 10", "--wait", "--wait-for-jobs")
 	expected := `Upgrading release=release, chart=chart
-exec: helm --kube-context dev upgrade --install --reset-values release chart --timeout 10 --wait
+exec: helm --kube-context dev upgrade --install --reset-values release chart --timeout 10 --wait --wait-for-jobs
 `
 	if buffer.String() != expected {
 		t.Errorf("helmexec.SyncRelease()\nactual = %v\nexpect = %v", buffer.String(), expected)
@@ -205,9 +205,9 @@ func Test_SyncReleaseTillerless(t *testing.T) {
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
 	helm.SyncRelease(HelmContext{Tillerless: true, TillerNamespace: "foo"}, "release", "chart",
-		"--timeout 10", "--wait")
+		"--timeout 10", "--wait", "--wait-for-jobs")
 	expected := `Upgrading release=release, chart=chart
-exec: helm --kube-context dev tiller run foo -- helm upgrade --install --reset-values release chart --timeout 10 --wait
+exec: helm --kube-context dev tiller run foo -- helm upgrade --install --reset-values release chart --timeout 10 --wait --wait-for-jobs
 `
 	if buffer.String() != expected {
 		t.Errorf("helmexec.SyncRelease()\nactual = %v\nexpect = %v", buffer.String(), expected)
@@ -289,13 +289,36 @@ Found secret in cache %s/secretName
 	}
 }
 
+func Test_DecryptSecretWithGotmpl(t *testing.T) {
+	var buffer bytes.Buffer
+	logger := NewLogger(&buffer, "debug")
+	helm := MockExecer(logger, "dev")
+
+	tmpFilePath := "path/to/temp/file"
+	helm.writeTempFile = func(content []byte) (string, error) {
+		return tmpFilePath, nil
+	}
+
+	secretName := "secretName.yaml.gotmpl"
+	_, decryptErr := helm.DecryptSecret(HelmContext{}, secretName)
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		t.Errorf("Error: %v", err)
+	}
+
+	expected := fmt.Sprintf(`%s/%s.yaml.dec`, cwd, secretName)
+	if d := cmp.Diff(expected, decryptErr.(*os.PathError).Path); d != "" {
+		t.Errorf("helmexec.DecryptSecret(): want (-), got (+):\n%s", d)
+	}
+}
+
 func Test_DiffRelease(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
-	helm.DiffRelease(HelmContext{}, "release", "chart", false, "--timeout 10", "--wait")
+	helm.DiffRelease(HelmContext{}, "release", "chart", false, "--timeout 10", "--wait", "--wait-for-jobs")
 	expected := `Comparing release=release, chart=chart
-exec: helm --kube-context dev diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait
+exec: helm --kube-context dev diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait --wait-for-jobs
 `
 	if buffer.String() != expected {
 		t.Errorf("helmexec.DiffRelease()\nactual = %v\nexpect = %v", buffer.String(), expected)
@@ -315,9 +338,9 @@ func Test_DiffReleaseTillerless(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := NewLogger(&buffer, "debug")
 	helm := MockExecer(logger, "dev")
-	helm.DiffRelease(HelmContext{Tillerless: true}, "release", "chart", false, "--timeout 10", "--wait")
+	helm.DiffRelease(HelmContext{Tillerless: true}, "release", "chart", false, "--timeout 10", "--wait", "--wait-for-jobs")
 	expected := `Comparing release=release, chart=chart
-exec: helm --kube-context dev tiller run -- helm diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait
+exec: helm --kube-context dev tiller run -- helm diff upgrade --reset-values --allow-unreleased release chart --timeout 10 --wait --wait-for-jobs
 `
 	if buffer.String() != expected {
 		t.Errorf("helmexec.DiffRelease()\nactual = %v\nexpect = %v", buffer.String(), expected)
@@ -407,8 +430,8 @@ func Test_exec(t *testing.T) {
 
 	buffer.Reset()
 	helm = MockExecer(logger, "dev")
-	helm.exec([]string{"diff", "release", "chart", "--timeout 10", "--wait"}, env)
-	expected = `exec: helm --kube-context dev diff release chart --timeout 10 --wait
+	helm.exec([]string{"diff", "release", "chart", "--timeout 10", "--wait", "--wait-for-jobs"}, env)
+	expected = `exec: helm --kube-context dev diff release chart --timeout 10 --wait --wait-for-jobs
 `
 	if buffer.String() != expected {
 		t.Errorf("helmexec.exec()\nactual = %v\nexpect = %v", buffer.String(), expected)

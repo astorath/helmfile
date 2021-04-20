@@ -30,6 +30,7 @@ type App struct {
 	Logger      *zap.SugaredLogger
 	Env         string
 	Namespace   string
+	Chart       string
 	Selectors   []string
 	Args        string
 	ValuesFiles []string
@@ -61,6 +62,8 @@ type HelmRelease struct {
 	Namespace string `json:"namespace"`
 	Enabled   bool   `json:"enabled"`
 	Labels    string `json:"labels"`
+	Chart     string `json:"chart"`
+	Version   string `json:"version"`
 }
 
 func New(conf ConfigProvider) *App {
@@ -70,6 +73,7 @@ func New(conf ConfigProvider) *App {
 		Logger:              conf.Logger(),
 		Env:                 conf.Env(),
 		Namespace:           conf.Namespace(),
+		Chart:               conf.Chart(),
 		Selectors:           conf.Selectors(),
 		Args:                conf.Args(),
 		FileOrDir:           conf.FileOrDir(),
@@ -121,21 +125,10 @@ func (a *App) Deps(c DepsConfigProvider) error {
 
 func (a *App) Repos(c ReposConfigProvider) error {
 	return a.ForEachState(func(run *Run) (_ bool, errs []error) {
-		var reposErr error
-
-		err := run.withPreparedCharts("repos", state.ChartPrepareOptions{
-			SkipRepos: true,
-			SkipDeps:  true,
-		}, func() {
-			reposErr = run.Repos(c)
-		})
+		reposErr := run.Repos(c)
 
 		if reposErr != nil {
 			errs = append(errs, reposErr)
-		}
-
-		if err != nil {
-			errs = append(errs, err)
 		}
 
 		return
@@ -173,9 +166,12 @@ func (a *App) Diff(c DiffConfigProvider) error {
 
 		var errs []error
 
+		includeCRDs := !c.SkipCRDs()
+
 		prepErr := run.withPreparedCharts("diff", state.ChartPrepareOptions{
-			SkipRepos: c.SkipDeps(),
-			SkipDeps:  c.SkipDeps(),
+			SkipRepos:   c.SkipDeps(),
+			SkipDeps:    c.SkipDeps(),
+			IncludeCRDs: &includeCRDs,
 		}, func() {
 			msg, matched, affected, errs = a.diff(run, c)
 		})
@@ -232,12 +228,15 @@ func (a *App) Template(c TemplateConfigProvider) error {
 	opts := []LoadOption{SetRetainValuesFiles(c.SkipCleanup())}
 
 	return a.ForEachState(func(run *Run) (ok bool, errs []error) {
+		includeCRDs := c.IncludeCRDs()
+
 		// `helm template` in helm v2 does not support local chart.
 		// So, we set forceDownload=true for helm v2 only
 		prepErr := run.withPreparedCharts("template", state.ChartPrepareOptions{
 			ForceDownload: !run.helm.IsHelm3(),
 			SkipRepos:     c.SkipDeps(),
 			SkipDeps:      c.SkipDeps(),
+			IncludeCRDs:   &includeCRDs,
 		}, func() {
 			ok, errs = a.template(run, c)
 		})
@@ -271,14 +270,32 @@ func (a *App) WriteValues(c WriteValuesConfigProvider) error {
 }
 
 func (a *App) Lint(c LintConfigProvider) error {
-	return a.ForEachState(func(run *Run) (_ bool, errs []error) {
+	return a.ForEachState(func(run *Run) (ok bool, errs []error) {
 		// `helm lint` on helm v2 and v3 does not support remote charts, that we need to set `forceDownload=true` here
 		prepErr := run.withPreparedCharts("lint", state.ChartPrepareOptions{
 			ForceDownload: true,
 			SkipRepos:     c.SkipDeps(),
 			SkipDeps:      c.SkipDeps(),
 		}, func() {
-			errs = run.Lint(c)
+			ok, errs = a.lint(run, c)
+		})
+
+		if prepErr != nil {
+			errs = append(errs, prepErr)
+		}
+
+		return
+	}, SetFilter(true))
+}
+
+func (a *App) Fetch(c FetchConfigProvider) error {
+	return a.ForEachState(func(run *Run) (ok bool, errs []error) {
+		prepErr := run.withPreparedCharts("pull", state.ChartPrepareOptions{
+			ForceDownload: true,
+			SkipRepos:     c.SkipDeps(),
+			SkipDeps:      c.SkipDeps(),
+			OutputDir:     c.OutputDir(),
+		}, func() {
 		})
 
 		if prepErr != nil {
@@ -291,10 +308,14 @@ func (a *App) Lint(c LintConfigProvider) error {
 
 func (a *App) Sync(c SyncConfigProvider) error {
 	return a.ForEachState(func(run *Run) (ok bool, errs []error) {
+		includeCRDs := !c.SkipCRDs()
+
 		prepErr := run.withPreparedCharts("sync", state.ChartPrepareOptions{
-			SkipRepos: c.SkipDeps(),
-			SkipDeps:  c.SkipDeps(),
-			Wait:      c.Wait(),
+			SkipRepos:   c.SkipDeps(),
+			SkipDeps:    c.SkipDeps(),
+			Wait:        c.Wait(),
+			WaitForJobs: c.WaitForJobs(),
+			IncludeCRDs: &includeCRDs,
 		}, func() {
 			ok, errs = a.sync(run, c)
 		})
@@ -317,10 +338,14 @@ func (a *App) Apply(c ApplyConfigProvider) error {
 	opts = append(opts, SetRetainValuesFiles(c.RetainValuesFiles() || c.SkipCleanup()))
 
 	err := a.ForEachState(func(run *Run) (ok bool, errs []error) {
+		includeCRDs := !c.SkipCRDs()
+
 		prepErr := run.withPreparedCharts("apply", state.ChartPrepareOptions{
-			SkipRepos: c.SkipDeps(),
-			SkipDeps:  c.SkipDeps(),
-			Wait:      c.Wait(),
+			SkipRepos:   c.SkipDeps(),
+			SkipDeps:    c.SkipDeps(),
+			Wait:        c.Wait(),
+			WaitForJobs: c.WaitForJobs(),
+			IncludeCRDs: &includeCRDs,
 		}, func() {
 			matched, updated, es := a.apply(run, c)
 
@@ -352,12 +377,12 @@ func (a *App) Apply(c ApplyConfigProvider) error {
 }
 
 func (a *App) Status(c StatusesConfigProvider) error {
-	return a.ForEachState(func(run *Run) (_ bool, errs []error) {
+	return a.ForEachState(func(run *Run) (ok bool, errs []error) {
 		err := run.withPreparedCharts("status", state.ChartPrepareOptions{
 			SkipRepos: true,
 			SkipDeps:  true,
 		}, func() {
-			errs = run.Status(c)
+			ok, errs = a.status(run, c)
 		})
 
 		if err != nil {
@@ -509,6 +534,8 @@ func (a *App) ListReleases(c ListConfigProvider) error {
 					Namespace: r.Namespace,
 					Enabled:   installed,
 					Labels:    labels,
+					Chart:     r.Chart,
+					Version:   r.Version,
 				})
 			}
 		})
@@ -616,6 +643,7 @@ func (a *App) loadDesiredStateFromYaml(file string, opts ...LoadOpts) (*state.He
 		directoryExistsAt: a.directoryExistsAt,
 		env:               a.Env,
 		namespace:         a.Namespace,
+		chart:             a.Chart,
 		logger:            a.Logger,
 		abs:               a.abs,
 		remote:            a.remote,
@@ -840,12 +868,16 @@ func printBatches(batches [][]state.Release) string {
 	return buf.String()
 }
 
-func withDAG(templated *state.HelmState, helm helmexec.Interface, logger *zap.SugaredLogger, reverse bool, converge func(*state.HelmState, helmexec.Interface) (bool, []error)) (bool, []error) {
-	batches, err := templated.PlanReleases(reverse)
+func withDAG(templated *state.HelmState, helm helmexec.Interface, logger *zap.SugaredLogger, opts state.PlanOptions, converge func(*state.HelmState, helmexec.Interface) (bool, []error)) (bool, []error) {
+	batches, err := templated.PlanReleases(opts)
 	if err != nil {
 		return false, []error{err}
 	}
 
+	return withBatches(templated, batches, helm, logger, converge)
+}
+
+func withBatches(templated *state.HelmState, batches [][]state.Release, helm helmexec.Interface, logger *zap.SugaredLogger, converge func(*state.HelmState, helmexec.Interface) (bool, []error)) (bool, []error) {
 	numBatches := len(batches)
 
 	logger.Debugf("processing %d groups of releases in this order:\n%s", numBatches, printBatches(batches))
@@ -938,12 +970,24 @@ func processFilteredReleases(st *state.HelmState, helm helmexec.Interface, conve
 		}
 	}
 
+	if err := checkDuplicates(helm, st, st.Releases); err != nil {
+		return false, []error{err}
+	}
+
+	errs := converge(st)
+
+	processed := len(st.Releases) != 0 && len(errs) == 0
+
+	return processed, errs
+}
+
+func checkDuplicates(helm helmexec.Interface, st *state.HelmState, releases []state.ReleaseSpec) error {
 	type Key struct {
 		TillerNamespace, Name, KubeContext string
 	}
 
 	releaseNameCounts := map[Key]int{}
-	for _, r := range st.Releases {
+	for _, r := range releases {
 		namespace := r.Namespace
 		if !helm.IsHelm3() {
 			if r.TillerNamespace != "" {
@@ -966,15 +1010,11 @@ func processFilteredReleases(st *state.HelmState, helm helmexec.Interface, conve
 				msg += fmt.Sprintf(" in kubecontext %q", name.KubeContext)
 			}
 
-			return false, []error{fmt.Errorf("duplicate release %q found%s: there were %d releases named \"%s\" matching specified selector", name.Name, msg, c, name.Name)}
+			return fmt.Errorf("duplicate release %q found%s: there were %d releases named \"%s\" matching specified selector", name.Name, msg, c, name.Name)
 		}
 	}
 
-	errs := converge(st)
-
-	processed := len(st.Releases) != 0 && len(errs) == 0
-
-	return processed, errs
+	return nil
 }
 
 func (a *App) Wrap(converge func(*state.HelmState, helmexec.Interface) []error) func(st *state.HelmState, helm helmexec.Interface) (bool, []error) {
@@ -982,6 +1022,14 @@ func (a *App) Wrap(converge func(*state.HelmState, helmexec.Interface) []error) 
 		return processFilteredReleases(st, helm, func(st *state.HelmState) []error {
 			return converge(st, helm)
 		})
+	}
+}
+
+func (a *App) WrapWithoutSelector(converge func(*state.HelmState, helmexec.Interface) []error) func(st *state.HelmState, helm helmexec.Interface) (bool, []error) {
+	return func(st *state.HelmState, helm helmexec.Interface) (bool, []error) {
+		errs := converge(st, helm)
+		processed := len(st.Releases) != 0 && len(errs) == 0
+		return processed, errs
 	}
 }
 
@@ -1027,7 +1075,7 @@ func (a *App) findDesiredStateFiles(specifiedPath string, opts LoadOpts) ([]stri
 		} else if defaultFile != "" {
 			return []string{defaultFile}, nil
 		} else {
-			return []string{}, fmt.Errorf("no state file found. It must be named %s/*.{yaml,yml}, %s, or %s, or otherwise specified with the --file flag", DefaultHelmfileDirectory, DefaultHelmfile, DeprecatedHelmfile)
+			return []string{}, fmt.Errorf("no state file found. It must be named %s/*.{yaml,yml} or %s, otherwise specified with the --file flag", DefaultHelmfileDirectory, DefaultHelmfile)
 		}
 	}
 
@@ -1050,6 +1098,10 @@ func (a *App) findDesiredStateFiles(specifiedPath string, opts LoadOpts) ([]stri
 func (a *App) getSelectedReleases(r *Run) ([]state.ReleaseSpec, error) {
 	releases, err := r.state.GetSelectedReleasesWithOverrides()
 	if err != nil {
+		return nil, err
+	}
+
+	if err := checkDuplicates(r.helm, r.state, releases); err != nil {
 		return nil, err
 	}
 
@@ -1078,9 +1130,22 @@ func (a *App) apply(r *Run, c ApplyConfigProvider) (bool, bool, []error) {
 		return false, false, nil
 	}
 
+	plan, err := st.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: toApply, SkipNeeds: c.SkipNeeds(), IncludeNeeds: c.IncludeNeeds()})
+	if err != nil {
+		return false, false, []error{err}
+	}
+
+	var toApplyWithNeeds []state.ReleaseSpec
+
+	for _, rs := range plan {
+		for _, r := range rs {
+			toApplyWithNeeds = append(toApplyWithNeeds, r.ReleaseSpec)
+		}
+	}
+
 	// Do build deps and prepare only on selected releases so that we won't waste time
 	// on running various helm commands on unnecessary releases
-	st.Releases = toApply
+	st.Releases = toApplyWithNeeds
 
 	// helm must be 2.11+ and helm-diff should be provided `--detailed-exitcode` in order for `helmfile apply` to work properly
 	detailedExitCode := true
@@ -1098,11 +1163,21 @@ func (a *App) apply(r *Run, c ApplyConfigProvider) (bool, bool, []error) {
 		return false, false, errs
 	}
 
+	var toDelete []state.ReleaseSpec
+	for _, r := range releasesToBeDeleted {
+		toDelete = append(toDelete, r)
+	}
+
+	var toUpdate []state.ReleaseSpec
+	for _, r := range releasesToBeUpdated {
+		toUpdate = append(toUpdate, r)
+	}
+
 	releasesWithNoChange := map[string]state.ReleaseSpec{}
-	for _, r := range toApply {
+	for _, r := range toApplyWithNeeds {
 		id := state.ReleaseToID(&r)
-		_, uninstalled := releasesToBeUpdated[id]
-		_, updated := releasesToBeDeleted[id]
+		_, uninstalled := releasesToBeDeleted[id]
+		_, updated := releasesToBeUpdated[id]
 		if !uninstalled && !updated {
 			releasesWithNoChange[id] = r
 		}
@@ -1146,7 +1221,7 @@ Do you really want to apply?
 
 		// We deleted releases by traversing the DAG in reverse order
 		if len(releasesToBeDeleted) > 0 {
-			_, deletionErrs := withDAG(st, helm, a.Logger, true, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+			_, deletionErrs := withDAG(st, helm, a.Logger, state.PlanOptions{Reverse: true, SelectedReleases: toDelete, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
 				var rs []state.ReleaseSpec
 
 				for _, r := range subst.Releases {
@@ -1167,7 +1242,7 @@ Do you really want to apply?
 
 		// We upgrade releases by traversing the DAG
 		if len(releasesToBeUpdated) > 0 {
-			_, updateErrs := withDAG(st, helm, a.Logger, false, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+			_, updateErrs := withDAG(st, helm, a.Logger, state.PlanOptions{SelectedReleases: toUpdate, Reverse: false, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
 				var rs []state.ReleaseSpec
 
 				for _, r := range subst.Releases {
@@ -1181,7 +1256,9 @@ Do you really want to apply?
 				syncOpts := state.SyncOpts{
 					Set:         c.Set(),
 					SkipCleanup: c.RetainValuesFiles() || c.SkipCleanup(),
+					SkipCRDs:    c.SkipCRDs(),
 					Wait:        c.Wait(),
+					WaitForJobs: c.WaitForJobs(),
 				}
 				return subst.SyncReleases(&affectedReleases, helm, c.Values(), c.Concurrency(), &syncOpts)
 			}))
@@ -1256,7 +1333,7 @@ Do you really want to delete?
 		r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
 
 		if len(releasesToDelete) > 0 {
-			_, deletionErrs := withDAG(st, helm, a.Logger, true, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+			_, deletionErrs := withDAG(st, helm, a.Logger, state.PlanOptions{Reverse: true, SkipNeeds: true}, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
 				var rs []state.ReleaseSpec
 
 				for _, r := range subst.Releases {
@@ -1279,6 +1356,193 @@ Do you really want to delete?
 	return true, errs
 }
 
+func (a *App) diff(r *Run, c DiffConfigProvider) (*string, bool, bool, []error) {
+	st := r.state
+
+	allReleases := st.GetReleasesWithOverrides()
+
+	toDiff, err := a.getSelectedReleases(r)
+	if err != nil {
+		return nil, false, false, []error{err}
+	}
+
+	if len(toDiff) == 0 {
+		return nil, false, false, nil
+	}
+
+	// Do build deps and prepare only on selected releases so that we won't waste time
+	// on running various helm commands on unnecessary releases
+	st.Releases = toDiff
+
+	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
+
+	opts := &state.DiffOpts{
+		Context: c.Context(),
+		NoColor: c.NoColor(),
+		Set:     c.Set(),
+	}
+
+	// Validate all releases for missing `needs` targets
+	st.Releases = allReleases
+
+	plan, err := st.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: toDiff, SkipNeeds: c.SkipNeeds(), IncludeNeeds: c.IncludeNeeds()})
+	if err != nil {
+		return nil, false, false, []error{err}
+	}
+
+	var toDiffWithNeeds []state.ReleaseSpec
+
+	for _, rs := range plan {
+		for _, r := range rs {
+			toDiffWithNeeds = append(toDiffWithNeeds, r.ReleaseSpec)
+		}
+	}
+
+	// Diff only targeted releases
+
+	st.Releases = toDiffWithNeeds
+
+	filtered := &Run{
+		state: st,
+		helm:  r.helm,
+		ctx:   r.ctx,
+		Ask:   r.Ask,
+	}
+
+	infoMsg, updated, deleted, errs := filtered.diff(true, c.DetailedExitcode(), c, opts)
+
+	return infoMsg, true, len(deleted) > 0 || len(updated) > 0, errs
+}
+
+func (a *App) lint(r *Run, c LintConfigProvider) (bool, []error) {
+	st := r.state
+	helm := r.helm
+
+	allReleases := st.GetReleasesWithOverrides()
+
+	selectedReleases, err := a.getSelectedReleases(r)
+	if err != nil {
+		return false, []error{err}
+	}
+	if len(selectedReleases) == 0 {
+		return false, nil
+	}
+
+	// Do build deps and prepare only on selected releases so that we won't waste time
+	// on running various helm commands on unnecessary releases
+	st.Releases = selectedReleases
+
+	releasesToRender := map[string]state.ReleaseSpec{}
+	for _, r := range selectedReleases {
+		id := state.ReleaseToID(&r)
+		if r.Installed != nil && !*r.Installed {
+			continue
+		}
+		releasesToRender[id] = r
+	}
+
+	var errs []error
+
+	// Traverse DAG of all the releases so that we don't suffer from false-positive missing dependencies
+	st.Releases = allReleases
+
+	args := argparser.GetArgs(c.Args(), st)
+
+	// Reset the extra args if already set, not to break `helm fetch` by adding the args intended for `lint`
+	helm.SetExtraArgs()
+
+	if len(args) > 0 {
+		helm.SetExtraArgs(args...)
+	}
+
+	if len(releasesToRender) > 0 {
+		_, templateErrs := withDAG(st, helm, a.Logger, state.PlanOptions{Reverse: false, SkipNeeds: true}, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+			var rs []state.ReleaseSpec
+
+			for _, r := range subst.Releases {
+				if r2, ok := releasesToRender[state.ReleaseToID(&r)]; ok {
+					rs = append(rs, r2)
+				}
+			}
+
+			subst.Releases = rs
+
+			opts := &state.LintOpts{
+				Set: c.Set(),
+			}
+			return subst.LintReleases(helm, c.Values(), args, c.Concurrency(), opts)
+		}))
+
+		if templateErrs != nil && len(templateErrs) > 0 {
+			errs = append(errs, templateErrs...)
+		}
+	}
+	return true, errs
+}
+
+func (a *App) status(r *Run, c StatusesConfigProvider) (bool, []error) {
+	st := r.state
+	helm := r.helm
+
+	allReleases := st.GetReleasesWithOverrides()
+
+	selectedReleases, err := a.getSelectedReleases(r)
+	if err != nil {
+		return false, []error{err}
+	}
+	if len(selectedReleases) == 0 {
+		return false, nil
+	}
+
+	// Do build deps and prepare only on selected releases so that we won't waste time
+	// on running various helm commands on unnecessary releases
+	st.Releases = selectedReleases
+
+	releasesToRender := map[string]state.ReleaseSpec{}
+	for _, r := range selectedReleases {
+		id := state.ReleaseToID(&r)
+		if r.Installed != nil && !*r.Installed {
+			continue
+		}
+		releasesToRender[id] = r
+	}
+
+	var errs []error
+
+	// Traverse DAG of all the releases so that we don't suffer from false-positive missing dependencies
+	st.Releases = allReleases
+
+	args := argparser.GetArgs(c.Args(), st)
+
+	// Reset the extra args if already set, not to break `helm fetch` by adding the args intended for `lint`
+	helm.SetExtraArgs()
+
+	if len(args) > 0 {
+		helm.SetExtraArgs(args...)
+	}
+
+	if len(releasesToRender) > 0 {
+		_, templateErrs := withDAG(st, helm, a.Logger, state.PlanOptions{Reverse: false, SkipNeeds: true}, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+			var rs []state.ReleaseSpec
+
+			for _, r := range subst.Releases {
+				if r2, ok := releasesToRender[state.ReleaseToID(&r)]; ok {
+					rs = append(rs, r2)
+				}
+			}
+
+			subst.Releases = rs
+
+			return subst.ReleaseStatuses(helm, c.Concurrency())
+		}))
+
+		if templateErrs != nil && len(templateErrs) > 0 {
+			errs = append(errs, templateErrs...)
+		}
+	}
+	return true, errs
+}
+
 func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	st := r.state
 	helm := r.helm
@@ -1293,11 +1557,24 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 		return false, nil
 	}
 
+	batches, err := st.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: toSync, IncludeNeeds: c.IncludeNeeds(), SkipNeeds: c.SkipNeeds()})
+	if err != nil {
+		return false, []error{err}
+	}
+
+	var toSyncWithNeeds []state.ReleaseSpec
+
+	for _, rs := range batches {
+		for _, r := range rs {
+			toSyncWithNeeds = append(toSyncWithNeeds, r.ReleaseSpec)
+		}
+	}
+
 	// Do build deps and prepare only on selected releases so that we won't waste time
 	// on running various helm commands on unnecessary releases
 	st.Releases = toSync
 
-	toDelete, err := st.DetectReleasesToBeDeletedForSync(helm, toSync)
+	toDelete, err := st.DetectReleasesToBeDeletedForSync(helm, toSyncWithNeeds)
 	if err != nil {
 		return false, []error{err}
 	}
@@ -1309,9 +1586,15 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	}
 
 	var toUpdate []state.ReleaseSpec
-	for _, r := range toSync {
+	for _, r := range toSyncWithNeeds {
 		if _, deleted := releasesToDelete[state.ReleaseToID(&r)]; !deleted {
-			toUpdate = append(toUpdate, r)
+			if r.Installed == nil || *r.Installed {
+				toUpdate = append(toUpdate, r)
+			} else {
+				// TODO Emit error when the user opted to fail when the needed release is disabled,
+				// instead of silently ignoring it.
+				// See https://github.com/roboll/helmfile/issues/1018
+			}
 		}
 	}
 
@@ -1322,7 +1605,7 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	}
 
 	releasesWithNoChange := map[string]state.ReleaseSpec{}
-	for _, r := range toSync {
+	for _, r := range toSyncWithNeeds {
 		id := state.ReleaseToID(&r)
 		_, uninstalled := releasesToDelete[id]
 		_, updated := releasesToUpdate[id]
@@ -1364,7 +1647,7 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	affectedReleases := state.AffectedReleases{}
 
 	if len(releasesToDelete) > 0 {
-		_, deletionErrs := withDAG(st, helm, a.Logger, true, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+		_, deletionErrs := withDAG(st, helm, a.Logger, state.PlanOptions{Reverse: true, SelectedReleases: toDelete, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
 			var rs []state.ReleaseSpec
 
 			for _, r := range subst.Releases {
@@ -1384,20 +1667,22 @@ func (a *App) sync(r *Run, c SyncConfigProvider) (bool, []error) {
 	}
 
 	if len(releasesToUpdate) > 0 {
-		_, syncErrs := withDAG(st, helm, a.Logger, false, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
+		_, syncErrs := withDAG(st, helm, a.Logger, state.PlanOptions{SelectedReleases: toUpdate, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
 			var rs []state.ReleaseSpec
 
 			for _, r := range subst.Releases {
-				if r2, ok := releasesToUpdate[state.ReleaseToID(&r)]; ok {
-					rs = append(rs, r2)
+				if _, ok := releasesToDelete[state.ReleaseToID(&r)]; !ok {
+					rs = append(rs, r)
 				}
 			}
 
 			subst.Releases = rs
 
 			opts := &state.SyncOpts{
-				Set:  c.Set(),
-				Wait: c.Wait(),
+				Set:         c.Set(),
+				SkipCRDs:    c.SkipCRDs(),
+				Wait:        c.Wait(),
+				WaitForJobs: c.WaitForJobs(),
 			}
 			return subst.SyncReleases(&affectedReleases, helm, c.Values(), c.Concurrency(), opts)
 		}))
@@ -1416,25 +1701,37 @@ func (a *App) template(r *Run, c TemplateConfigProvider) (bool, []error) {
 
 	allReleases := st.GetReleasesWithOverrides()
 
-	toRender, err := a.getSelectedReleases(r)
+	selectedReleases, err := a.getSelectedReleases(r)
 	if err != nil {
 		return false, []error{err}
 	}
-	if len(toRender) == 0 {
+	if len(selectedReleases) == 0 {
 		return false, nil
 	}
 
-	// Do build deps and prepare only on selected releases so that we won't waste time
-	// on running various helm commands on unnecessary releases
-	st.Releases = toRender
+	batches, err := st.PlanReleases(state.PlanOptions{Reverse: false, SelectedReleases: selectedReleases, IncludeNeeds: c.IncludeNeeds(), SkipNeeds: !c.IncludeNeeds()})
+	if err != nil {
+		return false, []error{err}
+	}
 
-	releasesToRender := map[string]state.ReleaseSpec{}
-	for _, r := range toRender {
+	var selectedReleasesWithNeeds []state.ReleaseSpec
+
+	for _, rs := range batches {
+		for _, r := range rs {
+			selectedReleasesWithNeeds = append(selectedReleasesWithNeeds, r.ReleaseSpec)
+		}
+	}
+
+	var toRender []state.ReleaseSpec
+
+	releasesDisabled := map[string]state.ReleaseSpec{}
+	for _, r := range selectedReleasesWithNeeds {
 		id := state.ReleaseToID(&r)
 		if r.Installed != nil && !*r.Installed {
-			continue
+			releasesDisabled[id] = r
+		} else {
+			toRender = append(toRender, r)
 		}
-		releasesToRender[id] = r
 	}
 
 	var errs []error
@@ -1451,18 +1748,8 @@ func (a *App) template(r *Run, c TemplateConfigProvider) (bool, []error) {
 		helm.SetExtraArgs(args...)
 	}
 
-	if len(releasesToRender) > 0 {
-		_, templateErrs := withDAG(st, helm, a.Logger, false, a.Wrap(func(subst *state.HelmState, helm helmexec.Interface) []error {
-			var rs []state.ReleaseSpec
-
-			for _, r := range subst.Releases {
-				if r2, ok := releasesToRender[state.ReleaseToID(&r)]; ok {
-					rs = append(rs, r2)
-				}
-			}
-
-			subst.Releases = rs
-
+	if len(toRender) > 0 {
+		_, templateErrs := withDAG(st, helm, a.Logger, state.PlanOptions{SelectedReleases: toRender, Reverse: false, SkipNeeds: true}, a.WrapWithoutSelector(func(subst *state.HelmState, helm helmexec.Interface) []error {
 			opts := &state.TemplateOpts{
 				Set:               c.Set(),
 				IncludeCRDs:       c.IncludeCRDs(),
@@ -1472,11 +1759,36 @@ func (a *App) template(r *Run, c TemplateConfigProvider) (bool, []error) {
 			return subst.TemplateReleases(helm, c.OutputDir(), c.Values(), args, c.Concurrency(), c.Validate(), opts)
 		}))
 
-		if templateErrs != nil && len(templateErrs) > 0 {
+		if len(templateErrs) > 0 {
 			errs = append(errs, templateErrs...)
 		}
 	}
 	return true, errs
+}
+
+func (a *App) test(r *Run, c TestConfigProvider) []error {
+	cleanup := c.Cleanup()
+	timeout := c.Timeout()
+	concurrency := c.Concurrency()
+
+	st := r.state
+
+	toTest, err := a.getSelectedReleases(r)
+	if err != nil {
+		return []error{err}
+	}
+
+	if len(toTest) == 0 {
+		return nil
+	}
+
+	// Do test only on selected releases, because that's what the user intended
+	// with conditions and selectors
+	st.Releases = toTest
+
+	r.helm.SetExtraArgs(argparser.GetArgs(c.Args(), r.state)...)
+
+	return st.TestReleases(r.helm, cleanup, timeout, concurrency, state.Logs(c.Logs()))
 }
 
 func (a *App) writeValues(r *Run, c WriteValuesConfigProvider) (bool, []error) {

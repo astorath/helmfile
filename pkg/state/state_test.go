@@ -314,6 +314,24 @@ func TestHelmState_flagsForUpgrade(t *testing.T) {
 			},
 		},
 		{
+			name: "wait-for-jobs",
+			defaults: HelmSpec{
+				WaitForJobs: false,
+			},
+			release: &ReleaseSpec{
+				Chart:       "test/chart",
+				Version:     "0.1",
+				WaitForJobs: &enable,
+				Name:        "test-charts",
+				Namespace:   "test-namespace",
+			},
+			want: []string{
+				"--version", "0.1",
+				"--wait-for-jobs",
+				"--namespace", "test-namespace",
+			},
+		},
+		{
 			name: "devel",
 			defaults: HelmSpec{
 				Devel: true,
@@ -1552,7 +1570,7 @@ func TestHelmState_DiffReleases(t *testing.T) {
 				valsRuntime:    valsRuntime,
 				RenderedValues: map[string]interface{}{},
 			}
-			_, errs := state.DiffReleases(tt.helm, []string{}, 1, false, false, false, false, false)
+			_, errs := state.DiffReleases(tt.helm, []string{}, 1, false, false, false, false, false, false)
 			if errs != nil && len(errs) > 0 {
 				t.Errorf("unexpected error: %v", errs)
 			}
@@ -1723,7 +1741,7 @@ func TestHelmState_DiffReleasesCleanup(t *testing.T) {
 `,
 			})
 			state = injectFs(state, testfs)
-			if _, errs := state.DiffReleases(tt.helm, []string{}, 1, false, false, false, false, false); errs != nil && len(errs) > 0 {
+			if _, errs := state.DiffReleases(tt.helm, []string{}, 1, false, false, false, false, false, false); errs != nil && len(errs) > 0 {
 				t.Errorf("unexpected errors: %v", errs)
 			}
 
